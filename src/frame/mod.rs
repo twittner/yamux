@@ -81,6 +81,10 @@ impl Frame<Data> {
     pub fn body(&self) -> &Bytes {
         &self.body
     }
+
+    pub fn into_body(self) -> Bytes {
+        self.body
+    }
 }
 
 impl Frame<WindowUpdate> {

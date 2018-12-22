@@ -33,6 +33,20 @@ quick_error! {
 
 quick_error! {
     #[derive(Debug)]
+    pub enum StreamError {
+        StreamClosed(id: stream::Id) {
+            display("stream {} is closed", id)
+        }
+        ConnectionClosed {
+            display("connection of this stream is closed")
+        }
+        #[doc(hidden)]
+        __Nonexhaustive
+    }
+}
+
+quick_error! {
+    #[derive(Debug)]
     pub enum ConnectionError {
         Io(e: io::Error) {
             display("i/o error: {}", e)

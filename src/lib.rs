@@ -24,8 +24,9 @@ mod frame;
 mod notify;
 mod stream;
 
-pub use crate::connection::{Connection, Mode, StreamHandle};
-pub use crate::error::{DecodeError, ConnectionError};
+pub use crate::connection::{Connection, Mode};
+pub use crate::stream::Stream;
+pub use crate::error::{DecodeError, StreamError, ConnectionError};
 
 pub(crate) const DEFAULT_CREDIT: u32 = 256 * 1024; // as per yamux specification
 
