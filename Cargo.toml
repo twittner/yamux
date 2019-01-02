@@ -15,6 +15,7 @@ nohash-hasher = "0.1"
 log = "0.4"
 parking_lot = "0.6"
 quick-error = "0.1"
+tokio = "0.1"
 tokio-codec = "0.1"
 tokio-io = "0.1"
 

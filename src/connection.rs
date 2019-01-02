@@ -31,26 +31,67 @@ use futures::{
     prelude::*,
     stream::{Fuse, Stream as FutStream},
     sync::{mpsc, oneshot},
-    task::Task,
     try_ready
 };
 use log::{debug, error, trace};
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    io,
     sync::Arc,
     u32,
     usize
 };
+use tokio;
 use tokio_codec::Framed;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode { Client, Server }
 
+/// Remote control
+pub struct Remote {
+    tx: mpsc::UnboundedSender<Command>,
+    rx: Fuse<mpsc::UnboundedReceiver<Stream>>
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        trace!("dropping remote");
+        let _ = self.tx.unbounded_send(Command::Close);
+    }
+}
+
+impl Remote {
+    pub fn open_stream(&mut self) -> impl Future<Item = Stream, Error = ConnectionError> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.unbounded_send(Command::OpenStream(tx)).is_err() {
+            Either::A(future::err(ConnectionError::Closed))
+        } else {
+            Either::B(rx.map_err(|_| ConnectionError::Closed))
+        }
+    }
+}
+
+impl futures::Stream for Remote {
+    type Item = Stream;
+    type Error = ConnectionError;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.rx.poll().map_err(|_| ConnectionError::Closed)
+    }
+}
+
 enum Command {
-    OpenStream(oneshot::Sender<Stream>)
+    OpenStream(oneshot::Sender<Stream>),
+    // TODO: Flush,
+    Close
+}
+
+struct Ports {
+    rx_command: Fuse<mpsc::UnboundedReceiver<Command>>,
+    tx_stream: mpsc::UnboundedSender<(stream::Id, stream::Item)>,
+    rx_stream: Fuse<mpsc::UnboundedReceiver<(stream::Id, stream::Item)>>,
+    tx_remote: mpsc::UnboundedSender<Stream>
 }
 
 struct StreamHandle {
@@ -59,18 +100,16 @@ struct StreamHandle {
     ack: bool
 }
 
+enum End { Front, Back }
+
 pub struct Connection<T> {
     mode: Mode,
     is_dead: bool,
     config: Arc<Config>,
     resource: Fuse<Framed<T, FrameCodec>>,
     streams: BTreeMap<stream::Id, StreamHandle>,
-    streams_rx: Fuse<mpsc::UnboundedReceiver<(stream::Id, stream::Item)>>,
-    streams_tx: mpsc::UnboundedSender<(stream::Id, stream::Item)>,
-    outgoing: VecDeque<RawFrame>,
-    commands_rx: Fuse<mpsc::UnboundedReceiver<Command>>,
-    commands_tx: mpsc::UnboundedSender<Command>,
-    tasks: Option<Task>,
+    ports: Ports,
+    pending: VecDeque<RawFrame>,
     next_id: u32
 }
 
@@ -78,8 +117,8 @@ impl<T> fmt::Debug for Connection<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Connection")
             .field("mode", &self.mode)
+            .field("open", &!self.is_dead)
             .field("streams", &self.streams.len())
-            .field("outgoing", &self.outgoing.len())
             .field("next_id", &self.next_id)
             .finish()
     }
@@ -87,59 +126,50 @@ impl<T> fmt::Debug for Connection<T> {
 
 impl<T> Connection<T>
 where
-    T: AsyncRead + AsyncWrite
+    T: AsyncRead + AsyncWrite + Send + 'static
 {
-    pub fn new(resource: T, config: Config, mode: Mode) -> Self {
-		let (streams_tx, streams_rx) = mpsc::unbounded();
-		let (commands_tx, commands_rx) = mpsc::unbounded();
+    pub fn new(resource: T, config: Config, mode: Mode) -> Remote {
+        let (ports, remote) = {
+            let (tx_command, rx_command) = mpsc::unbounded();
+            let (tx_stream, rx_stream) = mpsc::unbounded();
+            let (tx_remote, rx_remote) = mpsc::unbounded();
+            let remote = Remote {
+                tx: tx_command,
+                rx: rx_remote.fuse()
+            };
+            let ports = Ports {
+                rx_command: rx_command.fuse(),
+                tx_stream,
+                rx_stream: rx_stream.fuse(),
+                tx_remote
+            };
+            (ports, remote)
+        };
         let framed = Framed::new(resource, FrameCodec::new(&config));
-        Connection {
+        let connection = Connection {
             mode,
             is_dead: false,
             config: Arc::new(config),
-            streams: BTreeMap::new(),
-			streams_tx,
-            streams_rx: streams_rx.fuse(),
             resource: framed.fuse(),
-            outgoing: VecDeque::new(),
-            commands_rx: commands_rx.fuse(),
-            commands_tx,
-            tasks: None,
+            streams: BTreeMap::new(),
+            ports,
+            pending: VecDeque::new(),
             next_id: match mode {
                 Mode::Client => 1,
                 Mode::Server => 2
             }
-        }
+        };
+        tokio::spawn(connection.run().map_err(|e| { error!("{}", e); () }));
+        remote
     }
 
-    /// Open a new outbound stream which is multiplexed over the existing connection.
-    ///
-    /// This may fail if the underlying connection is already dead (in which case `None` is
-    /// returned), or for other reasons, e.g. if the (configurable) maximum number of streams is
-    /// already open.
-    pub fn open_stream(&mut self) -> impl Future<Item = Stream, Error = ConnectionError> {
-        trace!("open stream");
-        if self.is_dead {
-            return Either::A(future::err(ConnectionError::Closed))
-        }
-        let (tx, rx) = oneshot::channel();
-        self.commands_tx.unbounded_send(Command::OpenStream(tx)).unwrap();
-        if let Some(t) = self.tasks.as_ref() {
-            trace!("> notify current: {}", t.will_notify_current());
-        } else {
-            futures::task::current().notify()
-        }
-        Either::B(rx.map_err(|_| ConnectionError::Closed))
+    fn flush(&mut self) -> Poll<(), ConnectionError> {
+        self.resource.poll_complete().map_err(|e| { self.terminate(); e.into() })
     }
 
-    pub fn flush(&mut self) -> Poll<(), io::Error> {
-        trace!("flush");
-        self.resource.poll_complete().map_err(|e| { self.terminate(); e })
-    }
-
-    pub fn close(&mut self) -> Poll<(), io::Error> {
+    fn close(&mut self) -> Poll<(), ConnectionError> {
         self.is_dead = true;
-        self.resource.close().map_err(|e| { self.terminate(); e })
+        self.resource.close().map_err(|e| { self.terminate(); e.into() })
     }
 
     fn new_stream(&mut self, id: stream::Id, ack: bool, window: u32, credit: u32) -> Stream {
@@ -152,7 +182,7 @@ where
         };
         self.streams.insert(id, stream);
         let rx = executor::spawn(rx.fuse());
-        Stream::new(id, self.config.clone(), window, credit, self.streams_tx.clone(), rx)
+        Stream::new(id, self.config.clone(), window, credit, self.ports.tx_stream.clone(), rx)
     }
 
     fn next_stream_id(&mut self) -> Result<stream::Id, ConnectionError> {
@@ -225,7 +255,7 @@ where
             if stream.window.get() == 0 && self.config.window_update_mode == WindowUpdateMode::OnReceive {
                 trace!("{:?}: stream {}: sending window update", self.mode, stream_id);
                 let frame = Frame::window_update(stream_id, self.config.receive_window);
-                self.outgoing.push_back(frame.into_raw());
+                self.pending.push_back(frame.into_raw());
                 stream.window.set(self.config.receive_window as usize)
             }
             let _ = stream.sender.unbounded_send(stream::Item::Data(frame.into_body()));
@@ -300,8 +330,8 @@ where
             Ok(AsyncSink::Ready) => Ok(Async::Ready(())),
             Ok(AsyncSink::NotReady(frame)) => {
                 match end {
-                    End::Front => self.outgoing.push_front(frame),
-                    End::Back => self.outgoing.push_back(frame)
+                    End::Front => self.pending.push_front(frame),
+                    End::Back => self.pending.push_back(frame)
                 }
                 Ok(Async::NotReady)
             }
@@ -317,142 +347,127 @@ where
         self.is_dead = true;
         self.streams.clear()
     }
-}
 
-enum End { Front, Back }
+    fn run(mut self) -> impl Future<Item = (), Error = ConnectionError> {
+        future::poll_fn(move || {
+            if self.is_dead {
+                return Ok(Async::Ready(()))
+            }
 
-impl<T> futures::Stream for Connection<T>
-where
-    T: AsyncRead + AsyncWrite
-{
-    type Item = Stream;
-    type Error = ConnectionError;
+            // First, check for outgoing frames we need to send.
+            while let Some(frame) = self.pending.pop_front() {
+                try_ready!(self.send(frame, End::Front))
+            }
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        trace!("1 poll: {}", self.is_dead);
-        if self.is_dead {
-            return Ok(Async::Ready(None))
-        }
-
-        trace!("2 poll");
-        // First, check for outgoing frames we need to send.
-        while let Some(frame) = self.outgoing.pop_front() {
-            trace!("outgoing frame: {:?}", frame);
-            try_ready!(self.send(frame, End::Front))
-        }
-
-        trace!("3 poll");
-        // Check for control commands.
-        while let Ok(Async::Ready(Some(Command::OpenStream(reply)))) = self.commands_rx.poll() {
-            trace!("command");
-            match self.next_stream_id() {
-                Ok(id) => {
-                    let s = self.new_stream(id, false, self.config.receive_window, DEFAULT_CREDIT);
-                    let mut f = Frame::window_update(id, self.config.receive_window);
-                    f.header_mut().syn();
-                    let _ = reply.send(s);
-                    try_ready!(self.send(f.into_raw(), End::Back))
-                }
-                Err(e) => {
-                    self.terminate();
-                    return Err(e)
+            // Check for control commands.
+            while let Ok(Async::Ready(Some(cmd))) = self.ports.rx_command.poll() {
+                match cmd {
+                    Command::OpenStream(reply) => {
+                        match self.next_stream_id() {
+                            Ok(id) => {
+                                let s = self.new_stream(id, false, self.config.receive_window, DEFAULT_CREDIT);
+                                let mut f = Frame::window_update(id, self.config.receive_window);
+                                f.header_mut().syn();
+                                let _ = reply.send(s);
+                                try_ready!(self.send(f.into_raw(), End::Back))
+                            }
+                            Err(e) => {
+                                self.terminate();
+                                return Err(e)
+                            }
+                        }
+                    }
+                    Command::Close => {
+                        self.is_dead = true;
+                        try_ready!(self.close());
+                        return Ok(Async::Ready(()))
+                    }
                 }
             }
-        }
 
-        trace!("4 poll");
-        // Check for items from streams.
-        while let Ok(Async::Ready(Some(item))) = self.streams_rx.poll() {
-            let frame = match item.1 {
-                stream::Item::Data(body) => {
-                    let mut frame = Frame::data(item.0, body);
-                    if let Some(stream) = self.streams.get_mut(&item.0) {
-                        if stream.ack {
-                            stream.ack = false;
-                            frame.header_mut().ack()
+            // Check for items from streams.
+            while let Ok(Async::Ready(Some(item))) = self.ports.rx_stream.poll() {
+                let frame = match item.1 {
+                    stream::Item::Data(body) => {
+                        let mut frame = Frame::data(item.0, body);
+                        if let Some(stream) = self.streams.get_mut(&item.0) {
+                            if stream.ack {
+                                stream.ack = false;
+                                frame.header_mut().ack()
+                            }
                         }
+                        frame.into_raw()
                     }
-                    frame.into_raw()
-                }
-                stream::Item::WindowUpdate(n) => {
-                    let mut frame = Frame::window_update(item.0, n);
-                    if let Some(stream) = self.streams.get_mut(&item.0) {
-                        if stream.ack {
-                            stream.ack = false;
-                            frame.header_mut().ack()
+                    stream::Item::WindowUpdate(n) => {
+                        let mut frame = Frame::window_update(item.0, n);
+                        if let Some(stream) = self.streams.get_mut(&item.0) {
+                            if stream.ack {
+                                stream.ack = false;
+                                frame.header_mut().ack()
+                            }
                         }
+                        frame.into_raw()
                     }
-                    frame.into_raw()
-                }
-                stream::Item::Reset => {
-                    self.streams.remove(&item.0);
-                    let mut header = Header::data(item.0, 0);
-                    header.rst();
-                    Frame::new(header).into_raw()
-                }
-                stream::Item::Finish => {
-                    let mut header = Header::data(item.0, 0);
-                    header.fin();
-                    Frame::new(header).into_raw()
-                }
-            };
-            try_ready!(self.send(frame, End::Back))
-        }
+                    stream::Item::Reset => {
+                        self.streams.remove(&item.0);
+                        let mut header = Header::data(item.0, 0);
+                        header.rst();
+                        Frame::new(header).into_raw()
+                    }
+                    stream::Item::Finish => {
+                        let mut header = Header::data(item.0, 0);
+                        header.fin();
+                        Frame::new(header).into_raw()
+                    }
+                };
+                try_ready!(self.send(frame, End::Back))
+            }
 
-        trace!("5 poll");
-        // Finally, check for incoming data from remote.
-        loop {
-            try_ready!(self.flush());
-            match self.resource.poll() {
-                Ok(Async::Ready(Some(frame))) => {
-                    trace!("frame: {:?}", frame);
-                    match frame.dyn_type() {
-                        Type::Data => {
-                            match self.on_data(Frame::assert(frame)) {
-                                Ok(None) => {}
-                                Ok(Some(stream)) => return Ok(Async::Ready(Some(stream))),
-                                Err(frame) => try_ready!(self.send(frame.into_raw(), End::Back))
+            // Finally, check for incoming data from remote.
+            loop {
+                try_ready!(self.flush());
+                match self.resource.poll() {
+                    Ok(Async::Ready(Some(frame))) => {
+                        match frame.dyn_type() {
+                            Type::Data => {
+                                match self.on_data(Frame::assert(frame)) {
+                                    Ok(None) => {}
+                                    Ok(Some(stream)) => self.ports.tx_remote.unbounded_send(stream).unwrap(),
+                                    Err(frame) => try_ready!(self.send(frame.into_raw(), End::Back))
+                                }
                             }
-                        }
-                        Type::WindowUpdate => {
-                            match self.on_window_update(Frame::assert(frame)) {
-                                Ok(None) => {}
-                                Ok(Some(stream)) => return Ok(Async::Ready(Some(stream))),
-                                Err(frame) => try_ready!(self.send(frame.into_raw(), End::Back))
+                            Type::WindowUpdate => {
+                                match self.on_window_update(Frame::assert(frame)) {
+                                    Ok(None) => {}
+                                    Ok(Some(stream)) => self.ports.tx_remote.unbounded_send(stream).unwrap(),
+                                    Err(frame) => try_ready!(self.send(frame.into_raw(), End::Back))
+                                }
                             }
-                        }
-                        Type::Ping => {
-                            if let Some(pong) = self.on_ping(Frame::assert(frame)) {
-                                try_ready!(self.send(pong.into_raw(), End::Back))
+                            Type::Ping => {
+                                if let Some(pong) = self.on_ping(Frame::assert(frame)) {
+                                    try_ready!(self.send(pong.into_raw(), End::Back))
+                                }
                             }
-                        }
-                        Type::GoAway => {
-                            self.terminate();
-                            return Ok(Async::Ready(None))
+                            Type::GoAway => {
+                                self.terminate();
+                                return Ok(Async::Ready(()))
+                            }
                         }
                     }
-                }
-                Ok(Async::Ready(None)) => {
-                    trace!("resource eof");
-                    self.terminate();
-                    return Ok(Async::Ready(None))
-                }
-                Ok(Async::NotReady) => {
-                    if let Some(t) = self.tasks.as_ref() {
-                        trace!("notify current: {}", t.will_notify_current());
-                    } else {
-                        self.tasks = Some(futures::task::current());
+                    Ok(Async::Ready(None)) => {
+                        self.terminate();
+                        return Ok(Async::Ready(()))
                     }
-                    trace!("resource not ready");
-                    return Ok(Async::NotReady)
-                }
-                Err(e) => {
-                    trace!("resource error: {}", e);
-                    self.terminate();
-                    return Err(e.into())
+                    Ok(Async::NotReady) => {
+                        return Ok(Async::NotReady)
+                    }
+                    Err(e) => {
+                        self.terminate();
+                        return Err(e.into())
+                    }
                 }
             }
-        }
+        })
     }
 }
 

@@ -13,9 +13,9 @@ use log::{debug, error, warn};
 use std::io;
 use tokio::{net::{TcpListener, TcpStream}, runtime::Runtime};
 use tokio_codec::{BytesCodec, Framed};
-use yamux::{ConnectionError, Config, Connection, Mode};
+use yamux::{ConnectionError, Config, Connection, Mode, Remote};
 
-fn server_conn(addr: &str, cfg: Config) -> impl Future<Item=Connection<TcpStream>, Error=()> {
+fn server_conn(addr: &str, cfg: Config) -> impl Future<Item=Remote, Error=()> {
     TcpListener::bind(&addr.parse().unwrap())
         .unwrap()
         .incoming()
@@ -25,7 +25,7 @@ fn server_conn(addr: &str, cfg: Config) -> impl Future<Item=Connection<TcpStream
         .and_then(|(maybe, _rem)| maybe.ok_or(()))
 }
 
-fn client_conn(addr: &str, cfg: Config) -> impl Future<Item=Connection<TcpStream>, Error=()> {
+fn client_conn(addr: &str, cfg: Config) -> impl Future<Item=Remote, Error=()> {
     let address = addr.parse().unwrap();
     TcpStream::connect(&address)
         .map_err(|e| error!("connect failed: {}", e))

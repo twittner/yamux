@@ -24,7 +24,7 @@ mod frame;
 mod notify;
 mod stream;
 
-pub use crate::connection::{Connection, Mode};
+pub use crate::connection::{Connection, Mode, Remote};
 pub use crate::stream::Stream;
 pub use crate::error::{DecodeError, StreamError, ConnectionError};
 
