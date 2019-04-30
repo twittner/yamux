@@ -31,6 +31,7 @@ use futures::{
     prelude::*,
     sync::{mpsc, oneshot}
 };
+use future_union::future_union;
 use log::{debug, error, trace};
 use holly::{actor::Fail, prelude::*, stream::KillCord};
 use std::{collections::{hash_map::Entry, HashMap}, fmt, sync::Arc};
@@ -180,15 +181,12 @@ impl From<Fail<Error>> for Message {
     }
 }
 
-// Result type of `Connection::process`.
-type ActorFuture<A> = Box<dyn Future<Item = State<A, Message>, Error = Void> + Send>;
-
 // The actual actor implementation.
 impl<T> Actor<Message, Void> for Connection<T>
 where
     T: AsyncRead + AsyncWrite + Send + 'static
 {
-    type Result = ActorFuture<Self>;
+    existential type Result: Future<Item = State<Self, Message>, Error = Void> + Send;
 
     fn process(self, ctx: &mut Context<Message>, msg: Option<Message>) -> Self::Result {
         let Connection { mut admin, state } = self;
@@ -220,7 +218,7 @@ where
                             Ok(State::Done)
                         });
 
-                    Box::new(future)
+                    future_union!(15, 0, future)
                 }
                 msg => {
                     // Getting the initial setup message wrong is an obvious
@@ -229,9 +227,9 @@ where
                 }
             }
             ConnState::Open(state) => match msg {
-                Some(Message::OpenStream(requestor)) => state.open_stream(admin, requestor),
-                Some(Message::EndOfStream(id)) => state.end_of_stream(admin, id),
-                Some(Message::FromRemote(item)) => state.on_frame(admin, item),
+                Some(Message::OpenStream(requestor)) => future_union!(15, 1, state.open_stream(admin, requestor)),
+                Some(Message::EndOfStream(id)) => future_union!(15, 2, state.end_of_stream(admin, id)),
+                Some(Message::FromRemote(item)) => future_union!(15, 3, state.on_frame(admin, item)),
                 Some(Message::Setup) => {
                     // Sending the initial setup message multiple times is an
                     // obvious programmer error which deserves a panic.
@@ -249,30 +247,30 @@ where
                     }
                     if n == 0 {
                         // No streams => we can stop right away.
-                        immediate_close(admin, state.input, state.sender, CODE_TERM)
+                        future_union!(15, 4, immediate_close(admin, state.input, state.sender, CODE_TERM))
                     } else {
-                        ready_closing(n, admin, state.input, state.sender)
+                        future_union!(15, 5, ready_closing(n, admin, state.input, state.sender))
                     }
                 }
                 Some(Message::Abort(requestor)) => {
                     debug!("{}: aborting connection", admin.id);
-                    Box::new(state.sender.send(sender::Message::Drop).then(move |_| {
+                    future_union!(15, 6, state.sender.send(sender::Message::Drop).then(move |_| {
                         let _ = requestor.send(()); // if the receiver is already gone, so be it
                         Ok(State::Done)
                     }))
                 }
                 Some(Message::SendError(fail)) => {
                     debug!("{}: send error: {}", admin.id, fail.error());
-                    Box::new(future::ok(State::Done))
+                    future_union!(15, 7, future::ok(State::Done))
                 }
                 None => {
                     debug!("{}: end of stream", admin.id);
-                    Box::new(future::ok(State::Done))
+                    future_union!(15, 8, future::ok(State::Done))
                 }
             }
             ConnState::Closing(state) => match msg {
-                Some(Message::FromRemote(item)) => state.on_frame(admin, item),
-                Some(Message::EndOfStream(id)) => state.end_of_stream(admin, id),
+                Some(Message::FromRemote(item)) => future_union!(15, 9, state.on_frame(admin, item)),
+                Some(Message::EndOfStream(id)) => future_union!(15, 10, state.end_of_stream(admin, id)),
                 Some(Message::Setup) => {
                     // Sending the initial setup message multiple times is an
                     // obvious programmer error which deserves a panic.
@@ -280,22 +278,22 @@ where
                 }
                 m@Some(Message::Close(_)) | m@Some(Message::OpenStream(_)) => {
                     debug!("{}: ignoring message: {:?}", admin.id, m);
-                    ready_closing(state.remaining, admin, state.input, state.sender)
+                    future_union!(15, 11, ready_closing(state.remaining, admin, state.input, state.sender))
                 }
                 Some(Message::Abort(requestor)) => {
                     debug!("{}: aborting connection", admin.id);
-                    Box::new(state.sender.send(sender::Message::Drop).then(move |_| {
+                    future_union!(15, 12, state.sender.send(sender::Message::Drop).then(move |_| {
                         let _ = requestor.send(()); // if the receiver is already gone, so be it
                         Ok(State::Done)
                     }))
                 }
                 Some(Message::SendError(fail)) => {
                     debug!("{}: send error during shutdown: {}", admin.id, fail.error());
-                    Box::new(future::ok(State::Done))
+                    future_union!(15, 13, future::ok(State::Done))
                 }
                 None => {
                     debug!("{}: end of stream", admin.id);
-                    Box::new(future::ok(State::Done))
+                    future_union!(15, 14, future::ok(State::Done))
                 }
             }
         }
@@ -457,7 +455,7 @@ struct OpenState {
 impl OpenState {
     /// Process request to open a new stream to the remote.
     fn open_stream<T>(self, mut admin: ConnAdmin, req: oneshot::Sender<Result<stream::Stream, Error>>)
-        -> ActorFuture<Connection<T>>
+        -> impl Future<Item = State<Connection<T>, Message>, Error = Void>
     where
         T: AsyncRead + AsyncWrite + Send + 'static
     {
@@ -466,7 +464,7 @@ impl OpenState {
         if admin.streams.len() == admin.config.max_num_streams {
             debug!("{}: maximum number of streams reached", admin.id);
             let _ = req.send(Err(Error::TooManyStreams));
-            return ready_open(admin, input, sender)
+            return future_union!(4, 0, ready_open(admin, input, sender))
         }
 
         match admin.next_stream_id() {
@@ -476,7 +474,7 @@ impl OpenState {
                 let strepr = stream::StreamRepr::new(id, admin.config.clone(), DEFAULT_CREDIT);
                 let stream = stream::Stream::new(strepr.clone(), tx);
                 if req.send(Ok(stream)).is_err() {
-                    return ready_open(admin, input, sender)
+                    return future_union!(4, 0, ready_open(admin, input, sender))
                 }
                 let (i, s) = holly::stream::closable(id, rx);
                 // Send initial frame to remote informing it of the new stream.
@@ -499,7 +497,7 @@ impl OpenState {
                         Ok(State::Done)
                     });
 
-                Box::new(future)
+                future_union!(4, 1, future)
             }
             Err(e) => { // no more stream IDs => transition to closing
                 debug!("{}: stream IDs exhausted", admin.id);
@@ -508,9 +506,9 @@ impl OpenState {
                 close_all_streams(&mut admin);
                 if n == 0 {
                     // No streams => we can stop right away.
-                    immediate_close(admin, input, sender, CODE_TERM)
+                    future_union!(4, 2, immediate_close(admin, input, sender, CODE_TERM))
                 } else {
-                    ready_closing(n, admin, input, sender)
+                    future_union!(4, 3, ready_closing(n, admin, input, sender))
                 }
             }
         }
@@ -519,7 +517,8 @@ impl OpenState {
     /// One of our streams terminated.
     ///
     /// Cleanup and (if necessary) send reset frame to remote.
-    fn end_of_stream<T>(self, mut admin: ConnAdmin, id: stream::Id) -> ActorFuture<Connection<T>>
+    fn end_of_stream<T>(self, mut admin: ConnAdmin, id: stream::Id)
+        -> impl Future<Item = State<Connection<T>, Message>, Error = Void>
     where
         T: AsyncRead + AsyncWrite + Send + 'static
     {
@@ -528,7 +527,7 @@ impl OpenState {
         if let Some((_, s)) = admin.streams.remove(&id) {
             if s.state() == stream::State::Closed {
                 s.notify_tasks();
-                return ready_open(admin, input, sender)
+                return future_union!(2, 0, ready_open(admin, input, sender))
             }
             s.update_state(stream::State::Closed);
             s.notify_tasks();
@@ -540,13 +539,15 @@ impl OpenState {
                     debug!("sender is gone: {}", e);
                     Ok(State::Done)
                 });
-            return Box::new(future)
+            return future_union!(2, 1, future)
         }
-        ready_open(admin, input, sender)
+
+        future_union!(2, 0, ready_open(admin, input, sender))
     }
 
     /// Process incoming frame from remote.
-    fn on_frame<T>(self, mut admin: ConnAdmin, item: IncomingFrame) -> ActorFuture<Connection<T>>
+    fn on_frame<T>(self, mut admin: ConnAdmin, item: IncomingFrame)
+        -> impl Future<Item = State<Connection<T>, Message>, Error = Void>
     where
         T: AsyncRead + AsyncWrite + Send + 'static
     {
@@ -566,7 +567,7 @@ impl OpenState {
                             }
                             // TODO: We do not consider the frame body if the stream has been reset.
                             // Maybe we should.
-                            return ready_open(admin, input, sender)
+                            return future_union!(12, 0, ready_open(admin, input, sender))
                         }
 
                         let is_finish = frame.header().flags().contains(FIN); // half-close
@@ -575,19 +576,19 @@ impl OpenState {
                         if frame.header().flags().contains(SYN) {
                             if !admin.is_valid_remote_id(id, Type::Data) {
                                 debug!("{}: {}: invalid stream id", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_PROTO)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                             }
                             if frame.body().len() > DEFAULT_CREDIT as usize {
                                 debug!("{}: {}: initial frame body too large", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_PROTO)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                             }
                             if admin.streams.contains_key(&id) {
                                 debug!("{}: {}: stream already in use", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_PROTO)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                             }
                             if admin.streams.len() == admin.config.max_num_streams {
                                 debug!("{}: {}: too many streams", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_INTERNAL)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_INTERNAL))
                             }
 
                             // Create the new stream.
@@ -617,7 +618,7 @@ impl OpenState {
                                     debug!("sender is gone: {}", e);
                                     Ok(State::Done)
                                 });
-                            return Box::new(future)
+                            return future_union!(12, 2, future)
                         }
 
                         // Data for an existing stream.
@@ -625,7 +626,7 @@ impl OpenState {
                             Entry::Occupied(entry) => {
                                 if frame.body().len() > entry.get().1.window() as usize {
                                     debug!("{}: {}: frame body too large", admin.id, id);
-                                    return immediate_close(admin, input, sender, ECODE_PROTO)
+                                    return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                                 }
                                 if is_finish {
                                     entry.get().1.update_state(stream::State::WriteOnly);
@@ -645,7 +646,7 @@ impl OpenState {
                                             debug!("sender is gone: {}", e);
                                             Ok(State::Done)
                                         });
-                                    return Box::new(future)
+                                    return future_union!(12, 3, future)
                                 }
 
                                 let window = entry.get().1.decrement_window(frame.body().len() as u32);
@@ -667,14 +668,14 @@ impl OpenState {
                                             debug!("sender is gone: {}", e);
                                             Ok(State::Done)
                                         });
-                                    return Box::new(future)
+                                    return future_union!(12, 4, future)
                                 }
 
-                                return ready_open(admin, input, sender)
+                                return future_union!(12, 0, ready_open(admin, input, sender))
                             }
                             Entry::Vacant(_) if is_finish && frame.body().is_empty() => {
                                 // `FIN` for an unknown stream => ignore
-                                return ready_open(admin, input, sender)
+                                return future_union!(12, 0, ready_open(admin, input, sender))
                             }
                             Entry::Vacant(_) => {
                                 // Data for an unknown stream => ignore and tell
@@ -688,7 +689,7 @@ impl OpenState {
                                         debug!("sender is gone: {}", e);
                                         Ok(State::Done)
                                     });
-                                return Box::new(future)
+                                return future_union!(12, 5, future)
                             }
                         }
                     }
@@ -700,7 +701,7 @@ impl OpenState {
                                 stream.1.update_state(stream::State::Closed);
                                 stream.1.notify_tasks()
                             }
-                            return ready_open(admin, input, sender)
+                            return future_union!(12, 0, ready_open(admin, input, sender))
                         }
 
                         let is_finish = frame.header().flags().contains(FIN); // half-close
@@ -709,15 +710,15 @@ impl OpenState {
                         if frame.header().flags().contains(SYN) {
                             if !admin.is_valid_remote_id(id, Type::WindowUpdate) {
                                 debug!("{}: {}: invalid stream id", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_PROTO)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                             }
                             if admin.streams.contains_key(&id) {
                                 debug!("{}: {}: stream already in use", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_PROTO)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_PROTO))
                             }
                             if admin.streams.len() == admin.config.max_num_streams {
                                 debug!("{}: {}: too many streams", admin.id, id);
-                                return immediate_close(admin, input, sender, ECODE_INTERNAL)
+                                return future_union!(12, 1, immediate_close(admin, input, sender, ECODE_INTERNAL))
                             }
 
                             // Create the new stream.
@@ -745,7 +746,7 @@ impl OpenState {
                                     debug!("sender is gone: {}", e);
                                     Ok(State::Done)
                                 });
-                            return Box::new(future)
+                            return future_union!(12, 6, future)
                         }
 
                         if let Some(stream) = admin.streams.get_mut(&id) {
@@ -753,7 +754,7 @@ impl OpenState {
                             if is_finish {
                                 stream.1.update_state(stream::State::WriteOnly);
                             }
-                            ready_open(admin, input, sender)
+                            future_union!(12, 0, ready_open(admin, input, sender))
                         } else {
                             // Window update for an unknown stream => ignore and tell remote
                             // to reset the stream
@@ -766,7 +767,7 @@ impl OpenState {
                                     debug!("sender is gone: {}", e);
                                     Ok(State::Done)
                                 });
-                            Box::new(future)
+                            future_union!(12, 7, future)
                         }
                     }
                     Type::Ping => {
@@ -774,7 +775,7 @@ impl OpenState {
                         let id = frame.header().id();
 
                         if frame.header().flags().contains(ACK) { // Is this a pong to our own ping?
-                            return ready_open(admin, input, sender)
+                            return future_union!(12, 0, ready_open(admin, input, sender))
                         }
 
                         if id == CONNECTION_ID || admin.streams.contains_key(&id) {
@@ -789,24 +790,24 @@ impl OpenState {
                                     debug!("sender is gone: {}", e);
                                     Ok(State::Done)
                                 });
-                            return Box::new(future)
+                            return future_union!(12, 8, future)
                         }
 
-                        ready_open(admin, input, sender)
+                        future_union!(12, 0, ready_open(admin, input, sender))
                     }
                     Type::GoAway => {
                         debug!("{}: received GoAway", admin.id);
-                        Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                        future_union!(12, 9, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
                     }
                 }
             }
             holly::stream::Event::End(()) => { // connection closed
                 debug!("{}: connection closed", admin.id);
-                Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                future_union!(12, 10, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
             }
             holly::stream::Event::Error((), e) => { // connection error
                 debug!("{}: connection error: {}", admin.id, e);
-                Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                future_union!(12, 11, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
             }
         }
     }
@@ -832,7 +833,8 @@ impl ClosingState {
     /// One of our streams terminated.
     ///
     /// Cleanup and send reset frame if necessary to remote.
-    fn end_of_stream<T>(self, mut admin: ConnAdmin, id: stream::Id) -> ActorFuture<Connection<T>>
+    fn end_of_stream<T>(self, mut admin: ConnAdmin, id: stream::Id)
+        -> impl Future<Item = State<Connection<T>, Message>, Error = Void>
     where
         T: AsyncRead + AsyncWrite + Send + 'static
     {
@@ -840,13 +842,13 @@ impl ClosingState {
 
         if remaining == 1 {
             // This was the last one => close connection and stop.
-            return immediate_close(admin, input, sender, CODE_TERM)
+            return future_union!(3, 0, immediate_close(admin, input, sender, CODE_TERM))
         }
 
         if let Some((_, s)) = admin.streams.remove(&id) {
             if s.state() == stream::State::Closed {
                 s.notify_tasks();
-                return ready_closing(remaining - 1, admin, input, sender)
+                return future_union!(3, 1, ready_closing(remaining - 1, admin, input, sender))
             }
             s.update_state(stream::State::Closed);
             s.notify_tasks();
@@ -858,14 +860,15 @@ impl ClosingState {
                     debug!("sender is gone: {}", e);
                     Ok(State::Done)
                 });
-            return Box::new(future)
+            return future_union!(3, 2, future)
         }
 
-        ready_closing(remaining - 1, admin, input, sender)
+        future_union!(3, 1, ready_closing(remaining - 1, admin, input, sender))
     }
 
     /// Process incoming frame from remote.
-    fn on_frame<T>(self, admin: ConnAdmin, item: IncomingFrame) -> ActorFuture<Connection<T>>
+    fn on_frame<T>(self, admin: ConnAdmin, item: IncomingFrame)
+        -> impl Future<Item = State<Connection<T>, Message>, Error = Void>
     where
         T: AsyncRead + AsyncWrite + Send + 'static
     {
@@ -877,14 +880,14 @@ impl ClosingState {
                 match raw_frame.dyn_type() {
                     // We ignore incoming data while closing.
                     Type::Data | Type::WindowUpdate => {
-                        ready_closing(remaining, admin, input, sender)
+                        future_union!(5, 0, ready_closing(remaining, admin, input, sender))
                     }
                     Type::Ping => {
                         let frame = Frame::<Ping>::assert(raw_frame);
                         let id = frame.header().id();
 
                         if frame.header().flags().contains(ACK) { // A pong to our ping?
-                            return ready_closing(remaining, admin, input, sender)
+                            return future_union!(5, 0, ready_closing(remaining, admin, input, sender))
                         }
 
                         if id == CONNECTION_ID || admin.streams.contains_key(&id) {
@@ -899,24 +902,24 @@ impl ClosingState {
                                     debug!("sender is gone: {}", e);
                                     Ok(State::Done)
                                 });
-                            return Box::new(future)
+                            return future_union!(5, 1, future)
                         }
 
-                        ready_closing(remaining, admin, input, sender)
+                        future_union!(5, 0, ready_closing(remaining, admin, input, sender))
                     }
                     Type::GoAway => {
                         debug!("{}: received GoAway", admin.id);
-                        Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                        future_union!(5, 2, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
                     }
                 }
             }
             holly::stream::Event::End(()) => { // connection closed
                 debug!("{}: connection closed", admin.id);
-                Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                future_union!(5, 3, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
             }
             holly::stream::Event::Error((), e) => { // connection error
                 debug!("{}: connection error: {}", admin.id, e);
-                Box::new(sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
+                future_union!(5, 4, sender.send(sender::Message::Drop).then(|_| Ok(State::Done)))
             }
         }
     }
@@ -932,29 +935,30 @@ fn send_reset(id: stream::Id, sender: Sender) -> impl Future<Item = Sender, Erro
 }
 
 /// Send GoAway frame (honour potential write timeout) and transition to `State::Done`.
-fn immediate_close<T>(_admin: ConnAdmin, _input: KillCord, sender: Sender, code: u32)
-    -> ActorFuture<Connection<T>>
+fn immediate_close<T, M>(_admin: ConnAdmin, _input: KillCord, sender: Sender, code: u32)
+    -> impl Future<Item = State<Connection<T>, M>, Error = Void>
 where
     T: AsyncRead + AsyncWrite + Send + 'static
 {
-    Box::new(sender.send(sender::Message::Close(code)).then(|_| Ok(State::Done)))
+    sender.send(sender::Message::Close(code)).then(|_| Ok(State::Done))
 }
 
 /// Syntactic sugar to transition to `State::Ready` in `ConnState::Open`.
-fn ready_open<T>(admin: ConnAdmin, input: KillCord, sender: Sender) -> ActorFuture<Connection<T>>
+fn ready_open<T, M>(admin: ConnAdmin, input: KillCord, sender: Sender)
+    -> impl Future<Item = State<Connection<T>, M>, Error = Void>
 where
     T: AsyncRead + AsyncWrite + Send + 'static
 {
-    Box::new(future::ok(State::Ready(Connection::open(admin, input, sender))))
+    future::ok(State::Ready(Connection::open(admin, input, sender)))
 }
 
 /// Syntactic sugar to transition to `State::Ready` in `ConnState::Closing`.
-fn ready_closing<T>(rem: usize, admin: ConnAdmin, input: KillCord, sender: Sender)
-    -> ActorFuture<Connection<T>>
+fn ready_closing<T, M>(rem: usize, admin: ConnAdmin, input: KillCord, sender: Sender)
+    -> impl Future<Item = State<Connection<T>, M>, Error = Void>
 where
     T: AsyncRead + AsyncWrite + Send + 'static
 {
-    Box::new(future::ok(State::Ready(Connection::closing(rem, admin, input, sender))))
+    future::ok(State::Ready(Connection::closing(rem, admin, input, sender)))
 }
 
 /// Mark all streams as closed.

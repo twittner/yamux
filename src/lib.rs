@@ -17,6 +17,8 @@
 //! `Connection` implements `futures::Stream` yielding `StreamHandle`s for inbound connection
 //! attempts.
 
+#![feature(existential_type)]
+
 mod chunks;
 mod connection;
 mod error;

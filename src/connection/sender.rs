@@ -15,6 +15,7 @@ use crate::{
     stream
 };
 use futures::{future::{self, Either}, prelude::*, stream::Stream};
+use future_union::future_union;
 use log::{debug, trace};
 use holly::prelude::*;
 use std::{fmt, sync::Arc};
@@ -123,23 +124,21 @@ impl From<holly::stream::Event<stream::Id, stream::Item, ()>> for Message {
 }
 
 impl Actor<Message, Error> for Sender {
-    type Result = Box<dyn Future<Item = State<Self, Message>, Error = Error> + Send>;
+    existential type Result: Future<Item = State<Self, Message>, Error = Error> + Send;
 
     fn process(self, _ctx: &mut Context<Message>, msg: Option<Message>) -> Self::Result {
         let Sender { admin, output } = self;
         match msg {
             Some(Message::Send(frame)) => {
-                let future = send_frame(frame, &admin, output)
-                    .map(move |output| State::Ready(Sender { admin, output }));
-                Box::new(future)
+                future_union!(11, 0, send_frame(frame, &admin, output)
+                    .map(move |output| State::Ready(Sender { admin, output })))
             }
             Some(Message::SendAndFlush(frame)) => {
-                let future = send_frame_flush(frame, &admin, output)
-                    .map(move |output| State::Ready(Sender { admin, output }));
-                Box::new(future)
+                future_union!(11, 1, send_frame_flush(frame, &admin, output)
+                    .map(move |output| State::Ready(Sender { admin, output })))
             }
             Some(Message::AddStream(stream)) => {
-                Box::new(future::ok(State::Stream(Sender { admin, output }, stream)))
+                future_union!(11, 2, future::ok(State::Stream(Sender { admin, output }, stream)))
             }
             Some(Message::FromStream(item)) => match item {
                 holly::stream::Event::Item(id, item) => {
@@ -147,32 +146,28 @@ impl Actor<Message, Error> for Sender {
                         // New data to send to remote.
                         stream::Item::Data(bytes) => {
                             let frame = Frame::data(id, bytes).into_raw();
-                            let future = send_frame(frame, &admin, output)
-                                .map(move |output| State::Ready(Sender { admin, output }));
-                            Box::new(future)
+                            future_union!(11, 3, send_frame(frame, &admin, output)
+                                .map(move |output| State::Ready(Sender { admin, output })))
                         }
                         // Flush the connection.
                         stream::Item::Flush => {
-                            let future = flush(&admin, output)
-                                .map(move |output| State::Ready(Sender { admin, output }));
-                            Box::new(future)
+                            future_union!(11, 4, flush(&admin, output)
+                                .map(move |output| State::Ready(Sender { admin, output })))
                         }
                         // Grant more credit to the remote stream so it can continue
                         // sending more frames.
                         stream::Item::Credit => {
                             let frame = Frame::window_update(id, admin.config.receive_window);
-                            let future = send_frame_flush(frame.into_raw(), &admin, output)
-                                .map(move |output| State::Ready(Sender { admin, output }));
-                            Box::new(future)
+                            future_union!(11, 5, send_frame_flush(frame.into_raw(), &admin, output)
+                                .map(move |output| State::Ready(Sender { admin, output })))
                         }
                         // The stream will stop sending more data but continues to read.
                         stream::Item::HalfClose => {
                             let mut h = Header::data(id, 0);
                             h.fin();
                             let frame = Frame::new(h).into_raw();
-                            let future = send_frame_flush(frame, &admin, output)
-                                .map(move |output| State::Ready(Sender { admin, output }));
-                            Box::new(future)
+                            future_union!(11, 6, send_frame_flush(frame, &admin, output)
+                                .map(move |output| State::Ready(Sender { admin, output })))
                         }
                     }
                 }
@@ -180,24 +175,23 @@ impl Actor<Message, Error> for Sender {
                 // if anything, needs to be done.
                 holly::stream::Event::Error(stream, ()) | holly::stream::Event::End(stream) => {
                     let Admin { id, config, connection } = admin;
-                    let future = connection.send(EndOfStream(stream)).from_err()
+                    future_union!(11, 7, connection.send(EndOfStream(stream)).from_err()
                         .map(move |connection| {
                             let admin = Admin { id, config, connection };
                             State::Ready(Sender { admin, output })
-                        });
-                    Box::new(future)
+                        }))
                 }
             }
             Some(Message::Close(code)) => {
-                Box::new(close(admin, output, code).map(|()| State::Done))
+                future_union!(11, 8, close(admin, output, code).map(|()| State::Done))
             }
             Some(Message::Drop) => {
                 debug!("{}: closing output", admin.id);
-                Box::new(holly::sink::close(output).map(|()| State::Done).from_err())
+                future_union!(11, 9, holly::sink::close(output).map(|()| State::Done).from_err())
             }
             None => {
                 debug!("{}: end of stream", admin.id);
-                Box::new(close(admin, output, CODE_TERM).map(|()| State::Done))
+                future_union!(11, 10, close(admin, output, CODE_TERM).map(|()| State::Done))
             }
         }
     }

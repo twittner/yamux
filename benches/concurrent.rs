@@ -31,27 +31,7 @@ fn concurrent(c: &mut Criterion) {
         b.iter(move || roundtrip(params.streams, params.messages, data.clone(), false))
     },
     &[
-        Params { streams: 1,   messages:   1, size: 4096},
-        Params { streams: 10,  messages:   1, size: 4096},
-        Params { streams: 1,   messages:  10, size: 4096},
-        Params { streams: 100, messages:   1, size: 4096},
-        Params { streams: 1,   messages: 100, size: 4096},
-        Params { streams: 10,  messages: 100, size: 4096},
-        Params { streams: 100, messages:  10, size: 4096},
-    ]);
-
-    c.bench_function_over_inputs("all at once", |b, &&params| {
-        let data: Bytes = std::iter::repeat(0x42u8).take(params.size).collect::<Vec<_>>().into();
-        b.iter(move || roundtrip(params.streams, params.messages, data.clone(), true))
-    },
-    &[
-        Params { streams: 1,   messages:   1, size: 4096},
-        Params { streams: 10,  messages:   1, size: 4096},
-        Params { streams: 1,   messages:  10, size: 4096},
-        Params { streams: 100, messages:   1, size: 4096},
-        Params { streams: 1,   messages: 100, size: 4096},
-        Params { streams: 10,  messages: 100, size: 4096},
-        Params { streams: 100, messages:  10, size: 4096},
+        Params { streams: 1, messages:  100, size: 4096 }
     ]);
 }
 

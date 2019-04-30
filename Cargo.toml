@@ -11,6 +11,7 @@ edition = "2018"
 [dependencies]
 bytes = "0.4.12"
 futures = "0.1.25"
+future-union = "0.1.1"
 holly = "0.5.1"
 log = "0.4.6"
 parking_lot = "0.7.1"
@@ -30,3 +31,5 @@ tokio = "0.1.17"
 name = "concurrent"
 harness = false
 
+[profile.release]
+debug = true
