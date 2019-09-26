@@ -8,100 +8,165 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use bytes::BytesMut;
-use crate::{frame::header::{Header, RawHeader}, stream};
-use std::u32;
-
-pub mod codec;
 pub mod header;
 
+use bytes::BytesMut;
+use std::{fmt, io};
+use tokio_codec::{BytesCodec, Decoder, Encoder};
+
+/// A yamux message frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RawFrame {
-    pub header: RawHeader,
-    pub body: BytesMut
-}
-
-impl RawFrame {
-    pub fn dyn_type(&self) -> header::Type {
-        self.header.typ
-    }
-}
-
-#[derive(Debug)]
-pub enum Data {}
-#[derive(Debug)]
-pub enum WindowUpdate {}
-#[derive(Debug)]
-pub enum Ping {}
-#[derive(Debug)]
-pub enum GoAway {}
-
-#[derive(Clone, Debug)]
 pub struct Frame<T> {
-    header: Header<T>,
-    body: BytesMut
+    pub header: header::Header<T>,
+    pub body: BytesMut,
+    _private: ()
 }
 
-impl<T> Frame<T> {
-    pub(crate) fn assert(raw: RawFrame) -> Self {
-        Frame {
-            header: Header::assert(raw.header),
-            body: raw.body
-        }
-    }
+/// A decoder and encoder or message frames.
+#[derive(Debug)]
+pub struct Codec {
+    header_codec: header::Codec,
+    body_codec: BytesCodec,
+    header: Option<header::Header<()>>
+}
 
-    pub fn new(header: Header<T>) -> Frame<T> {
-        Frame { header, body: BytesMut::new() }
-    }
-
-    pub fn header(&self) -> &Header<T> {
-        &self.header
-    }
-
-    pub fn header_mut(&mut self) -> &mut Header<T> {
-        &mut self.header
-    }
-
-    pub fn into_raw(self) -> RawFrame {
-        RawFrame {
-            header: self.header.into_raw(),
-            body: self.body
+impl Codec {
+    /// Create a codec which accepts frames up to the max. body size.
+    pub fn new(max_body_len: usize) -> Codec {
+        Codec {
+            header_codec: header::Codec::new(max_body_len),
+            body_codec: BytesCodec::new(),
+            header: None
         }
     }
 }
 
-impl Frame<Data> {
-    pub fn data(id: stream::Id, b: BytesMut) -> Self {
-        Frame {
-            header: Header::data(id, b.len() as u32),
-            body: b
-        }
-    }
+impl Encoder for Codec {
+    type Item = Frame<()>;
+    type Error = io::Error;
 
-    pub fn body(&self) -> &BytesMut {
-        &self.body
-    }
-
-    pub fn into_body(self) -> BytesMut {
-        self.body
+    fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) -> io::Result<()> {
+        let header = self.header_codec.encode(&frame.header);
+        bytes.extend_from_slice(&header);
+        self.body_codec.encode(frame.body.freeze(), bytes)
     }
 }
 
-impl Frame<WindowUpdate> {
-    pub fn window_update(id: stream::Id, n: u32) -> Self {
-        Frame {
-            header: Header::window_update(id, n),
-            body: BytesMut::new()
+impl Decoder for Codec {
+    type Item = Frame<()>;
+    type Error = DecodeError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if self.header.is_none() {
+            if src.len() < header::HEADER_SIZE {
+                return Ok(None)
+            }
+            let mut b: [u8; header::HEADER_SIZE] = [0; header::HEADER_SIZE];
+            b.copy_from_slice(&src.split_to(header::HEADER_SIZE));
+            self.header = Some(self.header_codec.decode(b)?)
+        }
+
+        if let Some(header) = self.header.take() {
+            if header.tag() != header::Tag::Data {
+                return Ok(Some(Frame { header, body: BytesMut::new(), _private: () }))
+            }
+            let len = crate::u32_as_usize(header.len().val());
+            if len <= src.len() {
+                if let Some(body) = self.body_codec.decode(&mut src.split_to(len))? {
+                    return Ok(Some(Frame { header, body, _private: () }))
+                }
+            } else {
+                let add = len - src.len();
+                src.reserve(add)
+            }
+            self.header = Some(header)
+        }
+
+        Ok(None)
+    }
+}
+
+/// Possible errors while decoding a message frame.
+#[derive(Debug)]
+pub enum DecodeError {
+    /// An I/O error.
+    Io(io::Error),
+    /// Decoding the frame header failed.
+    Header(header::DecodeError),
+
+    #[doc(hidden)]
+    __Nonexhaustive
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DecodeError::Io(e) => write!(f, "i/o error: {}", e),
+            DecodeError::Header(e) => write!(f, "header error: {}", e),
+            DecodeError::__Nonexhaustive => f.write_str("__Nonexhaustive")
         }
     }
 }
 
-impl Frame<GoAway> {
-    pub fn go_away(error: u32) -> Self {
-        Frame {
-            header: Header::go_away(error),
-            body: BytesMut::new()
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecodeError::Io(e) => Some(e),
+            DecodeError::Header(e) => Some(e),
+            DecodeError::__Nonexhaustive => None
         }
+    }
+}
+
+
+impl From<io::Error> for DecodeError {
+    fn from(e: io::Error) -> Self {
+        DecodeError::Io(e)
+    }
+}
+
+impl From<header::DecodeError> for DecodeError {
+    fn from(e: header::DecodeError) -> Self {
+        DecodeError::Header(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use quickcheck::{Arbitrary, Gen, quickcheck};
+    use rand::Rng;
+    use super::*;
+
+    impl Arbitrary for Frame<()> {
+        fn arbitrary<G: Gen>(g: &mut G) -> Self {
+            let mut header: header::Header<()> = Arbitrary::arbitrary(g);
+            let body =
+                if header.tag() == header::Tag::Data {
+                    header.set_len(header.len().val() % g.gen_range(0, 8192));
+                    BytesMut::from(vec![0; crate::u32_as_usize(header.len().val())])
+                } else {
+                    BytesMut::new()
+                };
+            Frame { header, body, _private: () }
+        }
+    }
+
+    #[test]
+    fn encode_decode_identity() {
+        fn property(f: Frame<()>) -> bool {
+            let mut buf = BytesMut::with_capacity(header::HEADER_SIZE + f.body.len());
+            let mut codec = Codec::new(f.body.len());
+            if codec.encode(f.clone(), &mut buf).is_err() {
+                return false
+            }
+            if let Ok(x) = codec.decode(&mut buf) {
+                x == Some(f)
+            } else {
+                false
+            }
+        }
+        quickcheck(property as fn(Frame<()>) -> bool)
     }
 }
 

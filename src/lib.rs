@@ -18,14 +18,12 @@
 //! attempts.
 
 mod chunks;
-mod connection;
+//mod connection;
 mod error;
-#[allow(dead_code)]
 mod frame;
-mod notify;
 mod stream;
 
-pub use crate::connection::{Connection, Mode, StreamHandle};
+//pub use crate::connection::{Connection, Mode, StreamHandle};
 pub use crate::error::{DecodeError, ConnectionError};
 pub use crate::stream::State;
 
@@ -128,5 +126,10 @@ impl Config {
     pub fn set_read_after_close(&mut self, b: bool) {
         self.read_after_close = b;
     }
+}
+
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+const fn u32_as_usize(a: u32) -> usize {
+    a as usize
 }
 

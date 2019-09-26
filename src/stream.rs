@@ -9,16 +9,16 @@
 // at https://opensource.org/licenses/MIT.
 
 use crate::chunks::Chunks;
-use parking_lot::Mutex;
+use futures::lock::Mutex;
 use std::{fmt, sync::Arc, u32};
 
-pub(crate) const CONNECTION_ID: Id = Id(0);
+pub const CONNECTION_ID: Id = Id(0);
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Id(u32);
 
 impl Id {
-    pub(crate) fn new(id: u32) -> Id {
+    pub fn new(id: u32) -> Id {
         Id(id)
     }
 
@@ -70,15 +70,15 @@ impl State {
 }
 
 #[derive(Debug)]
-pub(crate) struct StreamEntry {
+pub struct StreamEntry {
     state: State,
-    pub(crate) window: u32,
-    pub(crate) credit: u32,
-    pub(crate) buffer: Arc<Mutex<Chunks>>
+    pub window: u32,
+    pub credit: u32,
+    pub buffer: Arc<Mutex<Chunks>>
 }
 
 impl StreamEntry {
-    pub(crate) fn new(window: u32, credit: u32) -> Self {
+    pub fn new(window: u32, credit: u32) -> Self {
         StreamEntry {
             state: State::Open,
             buffer: Arc::new(Mutex::new(Chunks::new())),
@@ -87,11 +87,11 @@ impl StreamEntry {
         }
     }
 
-    pub(crate) fn state(&self) -> State {
+    pub fn state(&self) -> State {
         self.state
     }
 
-    pub(crate) fn update_state(&mut self, next: State) {
+    pub fn update_state(&mut self, next: State) {
         use self::State::*;
 
         let current = self.state;

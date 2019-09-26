@@ -9,58 +9,93 @@
 // at https://opensource.org/licenses/MIT.
 
 use crate::stream;
-use quick_error::quick_error;
-use std::io;
+use std::{fmt, io};
 
-quick_error! {
-    #[derive(Debug)]
-    pub enum DecodeError {
-        Io(e: io::Error) {
-            display("i/o error: {}", e)
-            cause(e)
-            from()
+/// Possible errors while decoding a Yamux frame
+#[derive(Debug)]
+pub enum DecodeError {
+    /// An I/O error occurred.
+    Io(io::Error),
+    /// An unknown frame type.
+    Type(u8),
+    /// The frame body length to too large.
+    FrameTooLarge(usize),
+
+    #[doc(hidden)]
+    __Nonexhaustive
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DecodeError::Io(e) => write!(f, "i/o error: {}", e),
+            DecodeError::Type(t) => write!(f, "unkown frame type: {}", t),
+            DecodeError::FrameTooLarge(n) => write!(f, "frame body is too large ({})", n),
+            DecodeError::__Nonexhaustive => f.write_str("__Nonexhaustive")
         }
-        Type(t: u8) {
-            display("unkown type: {}", t)
-        }
-        FrameTooLarge(n: usize) {
-            display("frame body is too large ({})", n)
-        }
-        #[doc(hidden)]
-        __Nonexhaustive
     }
 }
 
-quick_error! {
-    #[derive(Debug)]
-    pub enum ConnectionError {
-        Io(e: io::Error) {
-            display("i/o error: {}", e)
-            cause(e)
-            from()
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecodeError::Io(e) => Some(e),
+            DecodeError::Type(_)
+            | DecodeError::FrameTooLarge(_)
+            | DecodeError::__Nonexhaustive => None
         }
-        Decode(e: DecodeError) {
-            display("decode error: {}", e)
-            cause(e)
-            from()
+    }
+}
+
+impl From<io::Error> for DecodeError {
+    fn from(e: io::Error) -> Self {
+        DecodeError::Io(e)
+    }
+}
+
+#[derive(Debug)]
+pub enum ConnectionError {
+    Io(io::Error),
+    Decode(DecodeError),
+    NoMoreStreamIds,
+    Closed,
+    StreamNotFound(stream::Id),
+    TooManyStreams,
+    TooManyPendingFrames,
+
+    #[doc(hidden)]
+    __Nonexhaustive
+}
+
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ConnectionError::Io(e) => write!(f, "i/o error: {}", e),
+            ConnectionError::Decode(e) => write!(f, "decode error: {}", e),
+            ConnectionError::NoMoreStreamIds =>
+                f.write_str("number of stream ids has been exhausted"),
+            ConnectionError::Closed => f.write_str("connection is closed"),
+            ConnectionError::StreamNotFound(id) => write!(f, "stream {} not found", id),
+            ConnectionError::TooManyStreams => f.write_str("maximum number of streams exhausted"),
+            ConnectionError::TooManyPendingFrames =>
+                f.write_str("maximum number of pending frames reached"),
+            ConnectionError::__Nonexhaustive => f.write_str("___Nonexhaustive")
         }
-        NoMoreStreamIds {
-            display("number of stream ids has been exhausted")
+    }
+}
+
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectionError::Io(e) => Some(e),
+            ConnectionError::Decode(e) => Some(e),
+            ConnectionError::NoMoreStreamIds
+            | ConnectionError::Closed
+            | ConnectionError::StreamNotFound(_)
+            | ConnectionError::TooManyStreams
+            | ConnectionError::TooManyPendingFrames
+            | ConnectionError::__Nonexhaustive => None
         }
-        Closed {
-            display("connection is closed")
-        }
-        StreamNotFound(id: stream::Id) {
-            display("stream {} not found", id)
-        }
-        TooManyStreams {
-            display("maximum number of streams exhausted")
-        }
-        TooManyPendingFrames {
-            display("maximum number of pending frames reached")
-        }
-        #[doc(hidden)]
-        __Nonexhaustive
     }
 }
 

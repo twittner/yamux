@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 //
 // Licensed under the Apache License, Version 2.0 or MIT license, at your option.
 //
@@ -24,12 +24,10 @@ use crate::{
         RawFrame,
         WindowUpdate
     },
-    notify::Notifier,
     stream::{self, State, StreamEntry, CONNECTION_ID}
 };
-use futures::{executor, prelude::*, stream::{Fuse, Stream}};
+use futures::{executor, lock::Mutex, prelude::*, stream::{Fuse, Stream}};
 use log::{debug, error, trace};
-use parking_lot::{Mutex, MutexGuard};
 use std::{
     cmp::min,
     collections::{BTreeMap, VecDeque},
@@ -41,7 +39,6 @@ use std::{
     usize
 };
 use tokio_codec::Framed;
-use tokio_io::{AsyncRead, AsyncWrite};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode { Client, Server }
@@ -78,8 +75,8 @@ where
     /// This may fail if the underlying connection is already dead (in which case `None` is
     /// returned), or for other reasons, e.g. if the (configurable) maximum number of streams is
     /// already open.
-    pub fn open_stream(&self) -> Result<Option<StreamHandle<T>>, ConnectionError> {
-        let mut connection = Use::with(self.inner.lock(), Action::None);
+    pub async fn open_stream(&self) -> Result<Option<StreamHandle<T>>, ConnectionError> {
+        let mut connection = self.inner.lock().await;
         if connection.status != ConnStatus::Open {
             return Ok(None)
         }
@@ -101,38 +98,26 @@ where
     /// Closes the underlying connection.
     ///
     /// Implies flushing any buffered data.
-    pub fn close(&self) -> Poll<(), ConnectionError> {
-        let mut connection = Use::with(self.inner.lock(), Action::Destroy);
+    pub async fn close(&self) -> Result<(), ConnectionError> {
+        let mut connection = Use::with(self.inner.lock().await, Action::Destroy);
         match connection.status {
-            ConnStatus::Closed => return Ok(Async::Ready(())),
+            ConnStatus::Closed => return Ok(()),
             ConnStatus::Open => {
                 connection.add_pending(Frame::go_away(header::CODE_TERM).into_raw())?;
                 connection.status = ConnStatus::Shutdown
             }
             ConnStatus::Shutdown => {}
         }
-        if connection.flush_pending()?.is_not_ready() {
-            connection.on_drop(Action::None);
-            return Ok(Async::NotReady)
-        }
-        // Make sure the current task is registered before calling
-        // `close_notify`, in order not to risk missing a notification.
-        connection.tasks.insert_current();
-        let result = {
-            let c = &mut *connection;
-            c.resource.close_notify(&c.tasks, 0)?
-        };
-        if result.is_not_ready() {
-            connection.on_drop(Action::None)
-        }
-        Ok(result)
+        connection.flush_pending().await?;
+        connection.resource.close().await?;
+        Ok(())
     }
 
     /// Send any buffered data.
-    pub fn flush(&self) -> Poll<(), ConnectionError> {
-        let mut connection = Use::with(self.inner.lock(), Action::Destroy);
+    pub async fn flush(&self) -> Result<(), ConnectionError> {
+        let mut connection = Use::with(self.inner.lock().await, Action::Destroy);
         if connection.status == ConnStatus::Closed {
-            return Ok(Async::Ready(()))
+            return Ok(())
         }
         let result = connection.flush_pending()?;
         connection.on_drop(Action::None);
@@ -180,45 +165,6 @@ where
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         Connection::poll(self)
-    }
-}
-
-enum Action { Destroy, None }
-
-struct Use<'a, T: 'a> {
-    inner: MutexGuard<'a, Inner<T>>,
-    on_drop: Action
-}
-
-impl<'a, T> Use<'a, T> {
-    fn with(inner: MutexGuard<'a, Inner<T>>, on_drop: Action) -> Self {
-        Use { inner, on_drop }
-    }
-
-    fn on_drop(&mut self, val: Action) {
-        self.on_drop = val
-    }
-}
-
-impl<'a, T> Deref for Use<'a, T> {
-    type Target = Inner<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.inner
-    }
-}
-
-impl<'a, T> DerefMut for Use<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.inner
-    }
-}
-
-impl<'a, T> Drop for Use<'a, T> {
-    fn drop(&mut self) {
-        if let Action::Destroy = self.on_drop {
-            self.inner.kill()
-        }
     }
 }
 
