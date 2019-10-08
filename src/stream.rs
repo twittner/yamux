@@ -10,40 +10,7 @@
 
 use crate::chunks::Chunks;
 use futures::lock::Mutex;
-use std::{fmt, sync::Arc, u32};
-
-pub const CONNECTION_ID: Id = Id(0);
-
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Id(u32);
-
-impl Id {
-    pub fn new(id: u32) -> Id {
-        Id(id)
-    }
-
-    pub fn is_server(self) -> bool {
-        self.0 % 2 == 0
-    }
-
-    pub fn is_client(self) -> bool {
-        !self.is_server()
-    }
-
-    pub fn is_session(self) -> bool {
-        self.0 == 0
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for Id {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {

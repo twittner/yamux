@@ -11,15 +11,91 @@
 pub mod header;
 
 use bytes::BytesMut;
-use std::{fmt, io};
+use fehler::throws;
+use header::{Header, StreamId, Data, WindowUpdate, GoAway};
+use std::{convert::TryInto, fmt, io};
 use tokio_codec::{BytesCodec, Decoder, Encoder};
 
 /// A yamux message frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame<T> {
-    pub header: header::Header<T>,
-    pub body: BytesMut,
-    _private: ()
+    header: Header<T>,
+    body: BytesMut
+}
+
+impl<T> Frame<T> {
+    pub fn new(header: Header<T>) -> Self {
+        Frame { header, body: BytesMut::new() }
+    }
+
+    pub fn header(&self) -> &Header<T> {
+        &self.header
+    }
+
+    pub fn header_mut(&mut self) -> &mut Header<T> {
+        &mut self.header
+    }
+
+    pub(crate) fn unchecked_cast<U>(self) -> Frame<U> {
+        Frame {
+            header: self.header.unchecked_cast(),
+            body: self.body
+        }
+    }
+}
+
+impl Frame<Data> {
+    #[throws]
+    pub fn data(id: StreamId, b: BytesMut) -> Self {
+        Frame {
+            header: Header::data(id, b.len().try_into()?),
+            body: b
+        }
+    }
+
+    pub fn body(&self) -> &BytesMut {
+        &self.body
+    }
+
+    pub fn body_mut(&mut self) -> &mut BytesMut {
+        &mut self.body
+    }
+
+    pub fn into_body(self) -> BytesMut {
+        self.body
+    }
+}
+
+impl Frame<WindowUpdate> {
+    pub fn window_update(id: StreamId, credit: u32) -> Self {
+        Frame {
+            header: Header::window_update(id, credit),
+            body: BytesMut::new()
+        }
+    }
+}
+
+impl Frame<GoAway> {
+    pub fn term() -> Self {
+        Frame {
+            header: Header::term(),
+            body: BytesMut::new()
+        }
+    }
+
+    pub fn protocol_error() -> Self {
+        Frame {
+            header: Header::protocol_error(),
+            body: BytesMut::new()
+        }
+    }
+
+    pub fn internal_error() -> Self {
+        Frame {
+            header: Header::internal_error(),
+            body: BytesMut::new()
+        }
+    }
 }
 
 /// A decoder and encoder or message frames.
@@ -45,10 +121,11 @@ impl Encoder for Codec {
     type Item = Frame<()>;
     type Error = io::Error;
 
-    fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) -> io::Result<()> {
+    #[throws(Self::Error)]
+    fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) {
         let header = self.header_codec.encode(&frame.header);
         bytes.extend_from_slice(&header);
-        self.body_codec.encode(frame.body.freeze(), bytes)
+        self.body_codec.encode(frame.body.freeze(), bytes)?
     }
 }
 
@@ -56,10 +133,11 @@ impl Decoder for Codec {
     type Item = Frame<()>;
     type Error = DecodeError;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    #[throws(DecodeError)]
+    fn decode(&mut self, src: &mut BytesMut) -> Option<Self::Item> {
         if self.header.is_none() {
             if src.len() < header::HEADER_SIZE {
-                return Ok(None)
+                return None
             }
             let mut b: [u8; header::HEADER_SIZE] = [0; header::HEADER_SIZE];
             b.copy_from_slice(&src.split_to(header::HEADER_SIZE));
@@ -68,12 +146,12 @@ impl Decoder for Codec {
 
         if let Some(header) = self.header.take() {
             if header.tag() != header::Tag::Data {
-                return Ok(Some(Frame { header, body: BytesMut::new(), _private: () }))
+                return Some(Frame { header, body: BytesMut::new() })
             }
             let len = crate::u32_as_usize(header.len().val());
             if len <= src.len() {
                 if let Some(body) = self.body_codec.decode(&mut src.split_to(len))? {
-                    return Ok(Some(Frame { header, body, _private: () }))
+                    return Some(Frame { header, body })
                 }
             } else {
                 let add = len - src.len();
@@ -82,7 +160,7 @@ impl Decoder for Codec {
             self.header = Some(header)
         }
 
-        Ok(None)
+        None
     }
 }
 

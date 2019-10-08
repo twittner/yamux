@@ -8,6 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+use fehler::{throw, throws};
 use std::fmt;
 
 /// The message frame header.
@@ -16,7 +17,7 @@ pub struct Header<T> {
     version: Version,
     tag: Tag,
     flags: Flags,
-    stream_id: Id,
+    stream_id: StreamId,
     length: Len,
     _marker: std::marker::PhantomData<T>
 }
@@ -34,7 +35,7 @@ impl<T> Header<T> {
         self.flags
     }
 
-    pub fn stream_id(&self) -> Id {
+    pub fn stream_id(&self) -> StreamId {
         self.stream_id
     }
 
@@ -89,12 +90,12 @@ impl<T: HasRst> Header<T> {
 
 impl Header<Data> {
     /// Create a new data frame header.
-    pub fn data(stream_id: Id, len: u32) -> Self {
+    pub fn data(id: StreamId, len: u32) -> Self {
         Header {
             version: Version(0),
             tag: Tag::Data,
             flags: Flags(0),
-            stream_id,
+            stream_id: id,
             length: Len(len),
             _marker: std::marker::PhantomData
         }
@@ -103,12 +104,12 @@ impl Header<Data> {
 
 impl Header<WindowUpdate> {
     /// Create a new window update frame header.
-    pub fn window_update(stream_id: Id, credit: u32) -> Self {
+    pub fn window_update(id: StreamId, credit: u32) -> Self {
         Header {
             version: Version(0),
             tag: Tag::WindowUpdate,
             flags: Flags(0),
-            stream_id,
+            stream_id: id,
             length: Len(credit),
             _marker: std::marker::PhantomData
         }
@@ -127,7 +128,7 @@ impl Header<Ping> {
             version: Version(0),
             tag: Tag::Ping,
             flags: Flags(0),
-            stream_id: Id(0),
+            stream_id: StreamId(0),
             length: Len(nonce),
             _marker: std::marker::PhantomData
         }
@@ -160,7 +161,7 @@ impl Header<GoAway> {
             version: Version(0),
             tag: Tag::GoAway,
             flags: Flags(0),
-            stream_id: Id(0),
+            stream_id: StreamId(0),
             length: Len(code),
             _marker: std::marker::PhantomData
         }
@@ -247,14 +248,38 @@ impl Len {
     }
 }
 
+pub const CONNECTION_ID: StreamId = StreamId(0);
+
 /// The stream ID of a message.
 /// The value 0 denotes no particular stream but the whole session.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Id(u32);
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamId(u32);
 
-impl Id {
+impl StreamId {
+    pub fn new(val: u32) -> Self {
+        StreamId(val)
+    }
+
+    pub fn is_server(self) -> bool {
+        self.0 % 2 == 0
+    }
+
+    pub fn is_client(self) -> bool {
+        !self.is_server()
+    }
+
+    pub fn is_session(self) -> bool {
+        self.0 == 0
+    }
+
     pub fn val(self) -> u32 {
         self.0
+    }
+}
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -311,9 +336,10 @@ impl Codec {
         buf
     }
 
-    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Result<Header<T>, DecodeError> {
+    #[throws(DecodeError)]
+    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Header<T> {
         if buf[0] != 0 {
-            return Err(DecodeError::Version(buf[0]))
+            throw!(DecodeError::Version(buf[0]))
         }
 
         let hdr = Header {
@@ -323,10 +349,10 @@ impl Codec {
                 1 => Tag::WindowUpdate,
                 2 => Tag::Ping,
                 3 => Tag::GoAway,
-                t => return Err(DecodeError::Type(t))
+                t => throw!(DecodeError::Type(t))
             },
             flags: Flags(u16::from_be_bytes([buf[2], buf[3]])),
-            stream_id: Id(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
+            stream_id: StreamId(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
             length: Len(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]])),
             _marker: std::marker::PhantomData
         };
@@ -334,15 +360,15 @@ impl Codec {
         if Tag::Data == hdr.tag {
             let len = crate::u32_as_usize(hdr.length.0);
             if len > self.max_body_len {
-                return Err(DecodeError::FrameTooLarge(len))
+                throw!(DecodeError::FrameTooLarge(len))
             }
         }
 
         if hdr.flags.0 > MAX_FLAG_VAL {
-            return Err(DecodeError::Flags(hdr.flags.0))
+            throw!(DecodeError::Flags(hdr.flags.0))
         }
 
-        Ok(hdr)
+        hdr
     }
 }
 
@@ -393,7 +419,7 @@ mod tests {
                 version: Version(0),
                 tag,
                 flags: Flags(std::cmp::min(g.gen(), MAX_FLAG_VAL)),
-                stream_id: Id(g.gen()),
+                stream_id: StreamId(g.gen()),
                 length: Len(g.gen()),
                 _marker: std::marker::PhantomData
             }

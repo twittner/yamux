@@ -8,58 +8,16 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::stream;
+use crate::{frame, frame::header::StreamId};
 use std::{fmt, io};
-
-/// Possible errors while decoding a Yamux frame
-#[derive(Debug)]
-pub enum DecodeError {
-    /// An I/O error occurred.
-    Io(io::Error),
-    /// An unknown frame type.
-    Type(u8),
-    /// The frame body length to too large.
-    FrameTooLarge(usize),
-
-    #[doc(hidden)]
-    __Nonexhaustive
-}
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            DecodeError::Io(e) => write!(f, "i/o error: {}", e),
-            DecodeError::Type(t) => write!(f, "unkown frame type: {}", t),
-            DecodeError::FrameTooLarge(n) => write!(f, "frame body is too large ({})", n),
-            DecodeError::__Nonexhaustive => f.write_str("__Nonexhaustive")
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DecodeError::Io(e) => Some(e),
-            DecodeError::Type(_)
-            | DecodeError::FrameTooLarge(_)
-            | DecodeError::__Nonexhaustive => None
-        }
-    }
-}
-
-impl From<io::Error> for DecodeError {
-    fn from(e: io::Error) -> Self {
-        DecodeError::Io(e)
-    }
-}
 
 #[derive(Debug)]
 pub enum ConnectionError {
     Io(io::Error),
-    Decode(DecodeError),
+    Decode(frame::DecodeError),
     NoMoreStreamIds,
     Closed,
-    StreamNotFound(stream::Id),
+    StreamNotFound(StreamId),
     TooManyStreams,
     TooManyPendingFrames,
 
@@ -99,3 +57,20 @@ impl std::error::Error for ConnectionError {
     }
 }
 
+impl From<io::Error> for ConnectionError {
+    fn from(e: io::Error) -> Self {
+        ConnectionError::Io(e)
+    }
+}
+
+impl From<frame::DecodeError> for ConnectionError {
+    fn from(e: frame::DecodeError) -> Self {
+        ConnectionError::Decode(e)
+    }
+}
+
+impl From<futures::channel::mpsc::SendError> for ConnectionError {
+    fn from(_: futures::channel::mpsc::SendError) -> Self {
+        ConnectionError::Closed
+    }
+}

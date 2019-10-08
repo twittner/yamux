@@ -18,16 +18,17 @@
 //! attempts.
 
 mod chunks;
-//mod connection;
+mod compat;
+mod connection;
 mod error;
 mod frame;
 mod stream;
 
-//pub use crate::connection::{Connection, Mode, StreamHandle};
-pub use crate::error::{DecodeError, ConnectionError};
+pub use crate::connection::{Connection, Mode, StreamHandle};
+pub use crate::error::ConnectionError;
 pub use crate::stream::State;
 
-pub(crate) const DEFAULT_CREDIT: u32 = 256 * 1024; // as per yamux specification
+const DEFAULT_CREDIT: u32 = 256 * 1024; // as per yamux specification
 
 /// Specifies when window update frames are sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,12 +69,12 @@ pub enum WindowUpdateMode {
 /// - read after close = true
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub(crate) receive_window: u32,
-    pub(crate) max_buffer_size: usize,
-    pub(crate) max_num_streams: usize,
-    pub(crate) max_pending_frames: usize,
-    pub(crate) window_update_mode: WindowUpdateMode,
-    pub(crate) read_after_close: bool
+    receive_window: u32,
+    max_buffer_size: usize,
+    max_num_streams: usize,
+    max_pending_frames: usize,
+    window_update_mode: WindowUpdateMode,
+    read_after_close: bool
 }
 
 impl Default for Config {
