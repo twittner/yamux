@@ -10,12 +10,15 @@ edition = "2018"
 
 [dependencies]
 bytes = "0.4.12"
+either = "1.5.3"
 fehler = "1.0.0-alpha.1"
 futures-preview = { version = "0.3.0-alpha.19", features = ["async-await"] }
 log = "0.4.8"
+nohash-hasher = "0.1.2"
 rand = "0.7.2"
-tokio-codec = "0.2.0-alpha.5"
-tokio-io = "0.2.0-alpha.5"
+thiserror = "1.0"
+tokio-codec = "0.2.0-alpha.6"
+tokio-io = "0.2.0-alpha.6"
 
 [dev-dependencies]
 criterion = "0.3.0"

@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright (c) 2018-2019 Parity Technologies (UK) Ltd.
 //
 // Licensed under the Apache License, Version 2.0 or MIT license, at your option.
 //
@@ -13,7 +13,8 @@ pub mod header;
 use bytes::BytesMut;
 use fehler::throws;
 use header::{Header, StreamId, Data, WindowUpdate, GoAway};
-use std::{convert::TryInto, fmt, io};
+use std::{convert::TryInto, io};
+use thiserror::Error;
 use tokio_codec::{BytesCodec, Decoder, Encoder};
 
 /// A yamux message frame.
@@ -36,9 +37,9 @@ impl<T> Frame<T> {
         &mut self.header
     }
 
-    pub(crate) fn unchecked_cast<U>(self) -> Frame<U> {
+    pub(crate) fn cast<U>(self) -> Frame<U> {
         Frame {
-            header: self.header.unchecked_cast(),
+            header: self.header.cast(),
             body: self.body
         }
     }
@@ -165,48 +166,19 @@ impl Decoder for Codec {
 }
 
 /// Possible errors while decoding a message frame.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
     /// An I/O error.
-    Io(io::Error),
+    #[error("i/o error: {0}")]
+    Io(#[from] io::Error),
+
     /// Decoding the frame header failed.
-    Header(header::DecodeError),
+    #[error("decode error: {0}")]
+    Header(#[from] header::DecodeError),
 
     #[doc(hidden)]
+    #[error("__Nonexhaustive")]
     __Nonexhaustive
-}
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            DecodeError::Io(e) => write!(f, "i/o error: {}", e),
-            DecodeError::Header(e) => write!(f, "header error: {}", e),
-            DecodeError::__Nonexhaustive => f.write_str("__Nonexhaustive")
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DecodeError::Io(e) => Some(e),
-            DecodeError::Header(e) => Some(e),
-            DecodeError::__Nonexhaustive => None
-        }
-    }
-}
-
-
-impl From<io::Error> for DecodeError {
-    fn from(e: io::Error) -> Self {
-        DecodeError::Io(e)
-    }
-}
-
-impl From<header::DecodeError> for DecodeError {
-    fn from(e: header::DecodeError) -> Self {
-        DecodeError::Header(e)
-    }
 }
 
 #[cfg(test)]
@@ -226,7 +198,7 @@ mod tests {
                 } else {
                     BytesMut::new()
                 };
-            Frame { header, body, _private: () }
+            Frame { header, body }
         }
     }
 

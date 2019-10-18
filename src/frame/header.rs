@@ -1,4 +1,4 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
+// Copyright (c) 2018-2019 Parity Technologies (UK) Ltd.
 //
 // Licensed under the Apache License, Version 2.0 or MIT license, at your option.
 //
@@ -10,6 +10,7 @@
 
 use fehler::{throw, throws};
 use std::fmt;
+use thiserror::Error;
 
 /// The message frame header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,7 +49,7 @@ impl<T> Header<T> {
         self.length = Len(len)
     }
 
-    pub(crate) fn unchecked_cast<U>(self) -> Header<U> {
+    pub(crate) fn cast<U>(self) -> Header<U> {
         Header {
             version: self.version,
             tag: self.tag,
@@ -373,34 +374,28 @@ impl Codec {
 }
 
 /// Possible errors while decoding a message frame header.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
     /// Unknown version.
+    #[error("unknown version: {0}")]
     Version(u8),
+
     /// An unknown frame type.
+    #[error("unknown frame type: {0}")]
     Type(u8),
+
     /// Unknown flags.
+    #[error("unknown flags type: {:0x}", .0)]
     Flags(u16),
+
     /// The frame body length larger than the configured maximum.
+    #[error("frame body is too large ({0})")]
     FrameTooLarge(usize),
 
     #[doc(hidden)]
+    #[error("__Nonexhaustive")]
     __Nonexhaustive
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            DecodeError::Version(x) => write!(f, "unkown version: {}", x),
-            DecodeError::Type(x) => write!(f, "unkown frame type: {}", x),
-            DecodeError::Flags(x) => write!(f, "unkown flags: {:0x}", x),
-            DecodeError::FrameTooLarge(n) => write!(f, "frame body is too large ({})", n),
-            DecodeError::__Nonexhaustive => f.write_str("__Nonexhaustive")
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
