@@ -8,6 +8,8 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+mod stream;
+
 use crate::{
     Config,
     DEFAULT_CREDIT,
@@ -31,15 +33,16 @@ use crate::{
             Tag,
             WindowUpdate
         }
-    },
-    stream::{State, StreamEntry}
+    }
 };
 use either::Either;
 use fehler::{throw, throws};
-use futures::{channel::{mpsc, oneshot}, lock::Mutex, prelude::*, stream::{self, SplitSink}};
+use futures::{channel::{mpsc, oneshot}, lock::Mutex, prelude::*, stream::SplitSink};
 use nohash_hasher::IntMap;
 use std::{fmt, pin::Pin, sync::Arc};
 use tokio_codec::Framed;
+
+pub use stream::{State, Stream};
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode {
@@ -65,7 +68,7 @@ impl fmt::Display for Id {
 #[derive(Debug)]
 enum Command {
     Inbound(Result<Frame<()>, frame::DecodeError>),
-    Open(oneshot::Sender<StreamHandle>),
+    Open(oneshot::Sender<Stream>),
     Outbound(Frame<()>),
     Flush,
     Close(oneshot::Sender<()>)
@@ -75,7 +78,7 @@ pub struct Control(mpsc::Sender<Command>);
 
 impl Control {
     #[throws(ConnectionError)]
-    pub async fn open_stream(&mut self) -> StreamHandle {
+    pub async fn open_stream(&mut self) -> Stream {
         let (tx, rx) = oneshot::channel();
         self.0.send(Command::Open(tx)).await?;
         rx.await?
@@ -94,9 +97,9 @@ pub struct Connection<T> {
     mode: Mode,
     config: Config,
     outgoing: SplitSink<Framed<crate::compat::AioCompat<T>, frame::Codec>, Frame<()>>,
-    incoming: Pin<Box<dyn Stream<Item = Result<Command, frame::DecodeError>>>>,
+    incoming: Pin<Box<dyn futures::stream::Stream<Item = Result<Command, frame::DecodeError>>>>,
     next_id: u32,
-    streams: IntMap<u32, StreamEntry>,
+    streams: IntMap<u32, Stream>,
     cmd_sender: mpsc::Sender<Command>
 }
 
@@ -125,7 +128,7 @@ where
         let (outgoing, incoming) = {
             let (sink, stream) = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).split();
             let stream = stream.map_ok(|f| Command::Inbound(Ok(f)));
-            (sink, Box::pin(stream::select(cmd_receiver.map(Ok), stream).fuse()))
+            (sink, Box::pin(futures::stream::select(cmd_receiver.map(Ok), stream).fuse()))
         };
 
         let conn = Connection {
@@ -146,7 +149,7 @@ where
     }
 
     #[throws(ConnectionError)]
-    pub async fn incoming_stream(&mut self) -> Option<StreamHandle> {
+    pub async fn incoming_stream(&mut self) -> Option<Stream> {
         while let Some(command) = self.incoming.try_next().await? {
             match command {
                 Command::Inbound(Err(e)) => throw!(e),
@@ -154,10 +157,7 @@ where
                     match self.on_frame(frame).await? {
                         Either::Left(None) => (),
                         Either::Left(Some(response)) => self.send_outgoing(response).await?,
-                        Either::Right(id) => {
-                            let buffer = self.streams.get(&id.val()).unwrap().buffer.clone();
-                            return Some(StreamHandle::new(id, buffer, self.cmd_sender.clone()))
-                        }
+                        Either::Right(id) => return Some(self.streams.get(&id.val()).unwrap().clone())
                     }
                 }
                 Command::Open(reply) => {}
@@ -173,15 +173,15 @@ where
     async fn send_outgoing<A>(&mut self, f: Frame<A>) {
         if let Err(e) = self.outgoing.send(f.cast()).await {
             log::debug!("{}: connection closed", self.id);
-            self.kill();
+            self.kill().await;
             throw!(e)
         }
     }
 
-    fn kill(&mut self) {
+    async fn kill(&mut self) {
         log::debug!("{}: destroying connection", self.id);
         for s in self.streams.values_mut() {
-            s.update_state(State::Closed)
+            s.update_state(State::Closed).await
         }
     }
 
@@ -229,7 +229,7 @@ where
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.update_state(State::Closed)
+                s.update_state(State::Closed).await
             }
             return Either::Left(None)
         }
@@ -253,12 +253,13 @@ where
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Either::Left(Some(Frame::internal_error()))
             }
-            let mut stream = StreamEntry::new(DEFAULT_CREDIT, DEFAULT_CREDIT);
+            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.cmd_sender.clone());
+            let inner = stream.inner().await;
             if is_finish {
-                stream.update_state(State::RecvClosed)
+                inner.update_state(State::RecvClosed)
             }
-            stream.window = stream.window.saturating_sub(frame.body().len() as u32);
-            stream.buffer.lock().await.push(frame.into_body());
+            inner.window = stream.window.saturating_sub(frame.body().len() as u32);
+            inner.buffer.push(frame.into_body());
             self.streams.insert(stream_id.val(), stream);
             return Either::Right(stream_id)
         }
@@ -270,7 +271,7 @@ where
                     return Either::Left(Some(Frame::protocol_error()))
                 }
                 if is_finish {
-                    stream.update_state(State::RecvClosed)
+                    stream.update_state(State::RecvClosed).await
                 }
                 let max_buffer_size = self.config.max_buffer_size;
                 let mut stream_buffer = stream.buffer.lock().await;
@@ -306,7 +307,7 @@ where
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.update_state(State::Closed)
+                s.update_state(State::Closed).await
             }
             return Either::Left(None)
         }
@@ -326,9 +327,9 @@ where
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Either::Left(Some(Frame::protocol_error()))
             }
-            let mut stream = StreamEntry::new(DEFAULT_CREDIT, frame.header().credit());
+            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, frame.header().credit(), self.cmd_sender.clone());
             if is_finish {
-                stream.update_state(State::RecvClosed)
+                stream.update_state(State::RecvClosed).await
             }
             self.streams.insert(stream_id.val(), stream);
             return Either::Right(stream_id)
@@ -337,7 +338,7 @@ where
         if let Some(stream) = self.streams.get_mut(&stream_id.val()) {
             stream.credit += frame.header().credit();
             if is_finish {
-                stream.update_state(State::RecvClosed)
+                stream.update_state(State::RecvClosed).await
             }
         }
 
@@ -382,7 +383,7 @@ where
             if let Some(stream) = self.streams.get_mut(&id.val()) {
                 if stream.state().can_write() {
                     log::debug!("{}: {}: finish stream", self.id, id);
-                    stream.update_state(State::SendClosed);
+                    stream.update_state(State::SendClosed).await;
                     let mut header = Header::data(id, 0);
                     header.fin();
                     Frame::new(header)
@@ -396,24 +397,24 @@ where
     }
 }
 
-/// A handle to a multiplexed stream.
-#[derive(Debug)]
-pub struct StreamHandle {
-    id: StreamId,
-    buffer: Arc<Mutex<Chunks>>,
-    outgoing: mpsc::Sender<Command>
-}
-
-impl StreamHandle {
-    fn new(id: StreamId, buffer: Arc<Mutex<Chunks>>, out: mpsc::Sender<Command>) -> Self {
-        StreamHandle { id, buffer, outgoing: out }
-    }
-
+///// A handle to a multiplexed stream.
+//#[derive(Debug)]
+//pub struct StreamHandle {
+//    id: StreamId,
+//    buffer: Arc<Mutex<Chunks>>,
+//    outgoing: mpsc::Sender<Command>
+//}
+//
+//impl StreamHandle {
+//    fn new(id: StreamId, buffer: Arc<Mutex<Chunks>>, out: mpsc::Sender<Command>) -> Self {
+//        StreamHandle { id, buffer, outgoing: out }
+//    }
+//
 //    /// Report how much sending credit this stream has available.
 //    pub fn credit(&self) -> Option<u32> {
 //        self.connection.inner.lock().streams.get(&self.id).map(|s| s.credit)
 //    }
-}
+//}
 //
 //impl<T> Drop for StreamHandle<T>
 //where

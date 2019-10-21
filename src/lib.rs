@@ -22,11 +22,9 @@ mod compat;
 mod connection;
 mod error;
 mod frame;
-mod stream;
 
-pub use crate::connection::{Connection, Mode, StreamHandle};
+pub use crate::connection::{Connection, Mode, Stream, State};
 pub use crate::error::ConnectionError;
-pub use crate::stream::State;
 
 const DEFAULT_CREDIT: u32 = 256 * 1024; // as per yamux specification
 

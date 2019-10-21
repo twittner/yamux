@@ -8,8 +8,8 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::chunks::Chunks;
-use futures::lock::Mutex;
+use crate::{chunks::Chunks, frame::header::StreamId};
+use futures::{channel::mpsc, lock::Mutex};
 use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -36,29 +36,48 @@ impl State {
     }
 }
 
-#[derive(Debug)]
-pub struct StreamEntry {
-    state: State,
-    pub window: u32,
-    pub credit: u32,
-    pub buffer: Arc<Mutex<Chunks>>
+#[derive(Clone, Debug)]
+pub struct Stream(Arc<Mutex<Inner>>);
+
+impl Stream {
+    pub fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<super::Command>) -> Self {
+        let inner = Inner::new(id, window, credit, sender);
+        Stream(Arc::new(Mutex::new(inner)))
+    }
+
+    pub(crate) async fn inner(&mut self) -> &mut Inner {
+        self.0.lock().await
+    }
+
 }
 
-impl StreamEntry {
-    pub fn new(window: u32, credit: u32) -> Self {
-        StreamEntry {
+#[derive(Debug)]
+pub(crate) struct Inner {
+    id: StreamId,
+    state: State,
+    sender: mpsc::Sender<super::Command>,
+    pub(crate) window: u32,
+    pub(crate) credit: u32,
+    pub(crate) buffer: Chunks
+}
+
+impl Inner {
+    fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<super::Command>) -> Self {
+        Inner {
+            id,
             state: State::Open,
-            buffer: Arc::new(Mutex::new(Chunks::new())),
+            sender,
             window,
-            credit
+            credit,
+            buffer: Chunks::new()
         }
     }
 
-    pub fn state(&self) -> State {
+    fn state(&self) -> State {
         self.state
     }
 
-    pub fn update_state(&mut self, next: State) {
+    pub(crate) fn update_state(&mut self, next: State) {
         use self::State::*;
 
         let current = self.state;
