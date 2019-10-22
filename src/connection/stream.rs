@@ -9,71 +9,92 @@
 // at https://opensource.org/licenses/MIT.
 
 use crate::{chunks::Chunks, frame::header::StreamId};
-use futures::{channel::mpsc, lock::Mutex};
+use futures::{channel::mpsc, lock::{Mutex, MutexGuard}};
 use std::sync::Arc;
+use super::Event;
 
+/// The state of a stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {
+    /// Open bidirectionally.
     Open,
+    /// Open for incoming messages.
     SendClosed,
+    /// Open for outgoing messages.
     RecvClosed,
+    /// Closed.
     Closed
 }
 
 impl State {
+    /// Can we receive messages over this stream?
     pub fn can_read(self) -> bool {
-        match self {
-            State::RecvClosed | State::Closed => false,
-            _ => true
+        if let State::RecvClosed | State::Closed = self {
+            false
+        } else {
+            true
         }
     }
 
+    /// Can we send messages over this stream?
     pub fn can_write(self) -> bool {
-        match self {
-            State::SendClosed | State::Closed => false,
-            _ => true
+        if let State::SendClosed | State::Closed = self {
+            false
+        } else {
+            true
         }
     }
 }
 
+/// A yamux stream.
 #[derive(Clone, Debug)]
-pub struct Stream(Arc<Mutex<Inner>>);
+pub struct Stream {
+    id: StreamId,
+    sender: mpsc::Sender<Event>,
+    shared: Arc<Mutex<Shared>>
+}
 
 impl Stream {
-    pub fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<super::Command>) -> Self {
-        let inner = Inner::new(id, window, credit, sender);
-        Stream(Arc::new(Mutex::new(inner)))
+    pub(crate) fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<Event>) -> Self {
+        Stream {
+            id,
+            shared: Arc::new(Mutex::new(Shared::new(window, credit))),
+            sender
+        }
     }
 
-    pub(crate) async fn inner(&mut self) -> &mut Inner {
-        self.0.lock().await
+    pub(crate) async fn shared(&mut self) -> MutexGuard<'_, Shared> {
+        self.shared.lock().await
     }
 
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.shared)
+    }
+
+    pub(crate) fn id(&self) -> StreamId {
+        self.id
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct Inner {
-    id: StreamId,
+pub(crate) struct Shared {
     state: State,
-    sender: mpsc::Sender<super::Command>,
     pub(crate) window: u32,
     pub(crate) credit: u32,
     pub(crate) buffer: Chunks
 }
 
-impl Inner {
-    fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<super::Command>) -> Self {
-        Inner {
-            id,
+impl Shared {
+    fn new(window: u32, credit: u32) -> Self {
+        Shared {
             state: State::Open,
-            sender,
             window,
             credit,
             buffer: Chunks::new()
         }
     }
 
-    fn state(&self) -> State {
+    pub(crate) fn state(&self) -> State {
         self.state
     }
 

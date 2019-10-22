@@ -36,7 +36,6 @@ use crate::{
     }
 };
 use either::Either;
-use fehler::{throw, throws};
 use futures::{channel::{mpsc, oneshot}, lock::Mutex, prelude::*, stream::SplitSink};
 use nohash_hasher::IntMap;
 use std::{fmt, pin::Pin, sync::Arc};
@@ -44,12 +43,20 @@ use tokio_codec::Framed;
 
 pub use stream::{State, Stream};
 
+type Result<T> = std::result::Result<T, ConnectionError>;
+
+/// How the connection is used.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode {
+    /// Client to server connection.
     Client,
+    /// Server to client connection.
     Server
 }
 
+/// The connection ID.
+///
+/// Randomly generated, this is mainly intended to improve log output.
 #[derive(Clone, Copy)]
 struct Id(u32);
 
@@ -65,42 +72,57 @@ impl fmt::Display for Id {
     }
 }
 
+/// Connection events.
 #[derive(Debug)]
-enum Command {
-    Inbound(Result<Frame<()>, frame::DecodeError>),
-    Open(oneshot::Sender<Stream>),
-    Outbound(Frame<()>),
-    Flush,
-    Close(oneshot::Sender<()>)
+pub(crate) enum Event {
+    /// A new frame as been decoded from remote.
+    InboundFrame(std::result::Result<Frame<()>, frame::DecodeError>),
+    /// A new frame should be sent to remote.
+    OutboundFrame(Frame<()>),
+    /// Open a new stream to remote.
+    OpenStream(oneshot::Sender<Stream>),
+    /// Flush the socket.
+    FlushConnection,
+    /// Close the connection.
+    CloseConnection(oneshot::Sender<()>)
 }
 
-pub struct Control(mpsc::Sender<Command>);
+/// Connection controller.
+#[derive(Clone)]
+pub struct Control(mpsc::Sender<Event>);
 
 impl Control {
-    #[throws(ConnectionError)]
-    pub async fn open_stream(&mut self) -> Stream {
+    /// Open a new stream to the remote.
+    pub async fn open_stream(&mut self) -> Result<Stream> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Command::Open(tx)).await?;
-        rx.await?
+        self.0.send(Event::OpenStream(tx)).await?;
+        Ok(rx.await?)
     }
 
-    #[throws(ConnectionError)]
-    pub async fn close(&mut self) {
+    /// Close the connection.
+    pub async fn close(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Command::Close(tx)).await?;
-        rx.await?
+        self.0.send(Event::CloseConnection(tx)).await?;
+        Ok(rx.await?)
     }
 }
 
+/// A stream of incoming events.
+type Incoming = Pin<Box<dyn futures::stream::Stream<Item = Result<Event>>>>;
+
+/// A sink of outgoing frames.
+type Outgoing<T> = SplitSink<Framed<crate::compat::AioCompat<T>, frame::Codec>, Frame<()>>;
+
+/// A yamux connection object.
 pub struct Connection<T> {
     id: Id,
     mode: Mode,
     config: Config,
-    outgoing: SplitSink<Framed<crate::compat::AioCompat<T>, frame::Codec>, Frame<()>>,
-    incoming: Pin<Box<dyn futures::stream::Stream<Item = Result<Command, frame::DecodeError>>>>,
+    outgoing: Outgoing<T>,
+    incoming: Incoming,
     next_id: u32,
     streams: IntMap<u32, Stream>,
-    cmd_sender: mpsc::Sender<Command>
+    cmd_sender: mpsc::Sender<Event>
 }
 
 impl<T> fmt::Debug for Connection<T> {
@@ -127,7 +149,7 @@ where
 
         let (outgoing, incoming) = {
             let (sink, stream) = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).split();
-            let stream = stream.map_ok(|f| Command::Inbound(Ok(f)));
+            let stream = stream.map_ok(|f| Event::InboundFrame(Ok(f))).err_into();
             (sink, Box::pin(futures::stream::select(cmd_receiver.map(Ok), stream).fuse()))
         };
 
@@ -148,52 +170,77 @@ where
         (conn, Control(cmd_sender))
     }
 
-    #[throws(ConnectionError)]
-    pub async fn incoming_stream(&mut self) -> Option<Stream> {
-        while let Some(command) = self.incoming.try_next().await? {
-            match command {
-                Command::Inbound(Err(e)) => throw!(e),
-                Command::Inbound(Ok(frame)) => {
+    /// Get the next incoming stream, opened by the remote.
+    ///
+    /// This must be called continously in order to make progress.
+    /// Once, `None` is returned the connection is closed.
+    pub async fn incoming_stream(&mut self) -> Result<Option<Stream>> {
+        while let Some(event) = self.incoming.try_next().await? {
+            match event {
+                Event::InboundFrame(Err(e)) => return Err(e.into()),
+                Event::InboundFrame(Ok(frame)) => {
                     match self.on_frame(frame).await? {
                         Either::Left(None) => (),
                         Either::Left(Some(response)) => self.send_outgoing(response).await?,
-                        Either::Right(id) => return Some(self.streams.get(&id.val()).unwrap().clone())
+                        Either::Right(stream) => {
+                            debug_assert!(self.streams.contains_key(&stream.id().val()));
+                            debug_assert!(stream.strong_count() > 1);
+                            return Ok(Some(stream))
+                        }
                     }
                 }
-                Command::Open(reply) => {}
-                Command::Outbound(frame) => self.send_outgoing(frame).await?,
-                Command::Flush => {}
-                Command::Close(reply) => {}
+                Event::OpenStream(reply) => {}
+                Event::OutboundFrame(frame) => self.send_outgoing(frame).await?,
+                Event::FlushConnection => {}
+                Event::CloseConnection(reply) => {}
             }
+            // Remove stale streams.
+            let conn_id = self.id;
+            self.streams.retain(|id, stream| {
+                if stream.strong_count() == 1 {
+                    log::trace!("{}: removing dropped stream {}", conn_id, id);
+                    return false
+                }
+                true
+            })
         }
-        None
+        Ok(None)
     }
 
-    #[throws(ConnectionError)]
-    async fn send_outgoing<A>(&mut self, f: Frame<A>) {
+    pub fn into_stream(self) -> impl futures::stream::Stream<Item = Result<Stream>> {
+        futures::stream::unfold(self, |mut this| async move {
+            match this.incoming_stream().await {
+                Ok(Some(s)) => Some((Ok(s), this)),
+                Ok(None) => None,
+                Err(e) => Some((Err(e), this))
+            }
+        })
+    }
+
+    async fn send_outgoing<A>(&mut self, f: Frame<A>) -> Result<()> {
         if let Err(e) = self.outgoing.send(f.cast()).await {
             log::debug!("{}: connection closed", self.id);
             self.kill().await;
-            throw!(e)
+            return Err(e.into())
         }
+        Ok(())
     }
 
     async fn kill(&mut self) {
         log::debug!("{}: destroying connection", self.id);
         for s in self.streams.values_mut() {
-            s.update_state(State::Closed).await
+            s.shared().await.update_state(State::Closed)
         }
     }
 
-    #[throws(ConnectionError)]
-    fn next_stream_id(&mut self) -> StreamId {
+    fn next_stream_id(&mut self) -> Result<StreamId> {
         let proposed = StreamId::new(self.next_id);
         self.next_id = self.next_id.checked_add(2).ok_or(ConnectionError::NoMoreStreamIds)?;
         match self.mode {
             Mode::Client => assert!(proposed.is_client()),
             Mode::Server => assert!(proposed.is_server())
         }
-        proposed
+        Ok(proposed)
     }
 
     fn is_valid_remote_id(&self, id: StreamId, tag: Tag) -> bool {
@@ -206,9 +253,8 @@ where
         }
     }
 
-    #[throws(ConnectionError)]
-    async fn on_frame(&mut self, frame: Frame<()>) -> Either<Option<Frame<()>>, StreamId> {
-        match frame.header().tag() {
+    async fn on_frame(&mut self, frame: Frame<()>) -> Result<Either<Option<Frame<()>>, Stream>> {
+        let result = match frame.header().tag() {
             Tag::Data =>
                 self.on_data(frame.cast()).await?.map_left(|o| o.map(Frame::cast)),
             Tag::WindowUpdate =>
@@ -219,19 +265,19 @@ where
                 self.kill();
                 Either::Left(None)
             }
-        }
+        };
+        Ok(result)
     }
 
-    #[throws(ConnectionError)]
-    async fn on_data(&mut self, frame: Frame<Data>) -> Either<Option<Frame<GoAway>>, StreamId> {
+    async fn on_data(&mut self, frame: Frame<Data>) -> Result<Either<Option<Frame<GoAway>>, Stream>> {
         let stream_id = frame.header().stream_id();
 
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.update_state(State::Closed).await
+                s.shared().await.update_state(State::Closed)
             }
-            return Either::Left(None)
+            return Ok(Either::Left(None))
         }
 
         let is_finish = frame.header().flags().contains(FIN); // half-close
@@ -239,77 +285,78 @@ where
         if frame.header().flags().contains(SYN) { // new stream
             if !self.is_valid_remote_id(stream_id, Tag::Data) {
                 log::error!("{}: {}: invalid stream id", self.id, stream_id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             if frame.body().len() > crate::u32_as_usize(DEFAULT_CREDIT) {
                 log::error!("{}: {}: initial data for stream exceeds default credit", self.id, stream_id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             if self.streams.contains_key(&stream_id.val()) {
                 log::error!("{}: {}: stream already exists", self.id, stream_id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             if self.streams.len() == self.config.max_num_streams {
                 log::error!("{}: maximum number of streams reached", self.id);
-                return Either::Left(Some(Frame::internal_error()))
+                return Ok(Either::Left(Some(Frame::internal_error())))
             }
             let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.cmd_sender.clone());
-            let inner = stream.inner().await;
-            if is_finish {
-                inner.update_state(State::RecvClosed)
+            {
+                let mut shared = stream.shared().await;
+                if is_finish {
+                    shared.update_state(State::RecvClosed)
+                }
+                shared.window = shared.window.saturating_sub(frame.body().len() as u32);
+                shared.buffer.push(frame.into_body());
             }
-            inner.window = stream.window.saturating_sub(frame.body().len() as u32);
-            inner.buffer.push(frame.into_body());
-            self.streams.insert(stream_id.val(), stream);
-            return Either::Right(stream_id)
+            self.streams.insert(stream_id.val(), stream.clone());
+            return Ok(Either::Right(stream))
         }
 
         let frame =
             if let Some(stream) = self.streams.get_mut(&stream_id.val()) {
-                if frame.body().len() > crate::u32_as_usize(stream.window) {
+                let mut shared = stream.shared().await;
+                if frame.body().len() > crate::u32_as_usize(shared.window) {
                     log::error!("{}: {}: frame body larger than window of stream", self.id, stream_id);
-                    return Either::Left(Some(Frame::protocol_error()))
+                    return Ok(Either::Left(Some(Frame::protocol_error())))
                 }
                 if is_finish {
-                    stream.update_state(State::RecvClosed).await
+                    shared.update_state(State::RecvClosed)
                 }
                 let max_buffer_size = self.config.max_buffer_size;
-                let mut stream_buffer = stream.buffer.lock().await;
-                if stream_buffer.len().map(move |n| n >= max_buffer_size).unwrap_or(true) {
+                if shared.buffer.len().map(move |n| n >= max_buffer_size).unwrap_or(true) {
                     log::error!("{}: {}: buffer of stream grows beyond limit", self.id, stream_id);
                     // TODO: self.reset(stream_id).await?;
-                    return Either::Left(None)
+                    return Ok(Either::Left(None))
                 }
-                stream.window = stream.window.saturating_sub(frame.body().len() as u32);
-                stream_buffer.push(frame.into_body());
+                shared.window = shared.window.saturating_sub(frame.body().len() as u32);
+                shared.buffer.push(frame.into_body());
                 if !is_finish
-                    && stream.window == 0
+                    && shared.window == 0
                     && self.config.window_update_mode == WindowUpdateMode::OnReceive
                 {
                     log::trace!("{}: {}: sending window update", self.id, stream_id);
-                    stream.window = self.config.receive_window;
+                    shared.window = self.config.receive_window;
                     Frame::window_update(stream_id, self.config.receive_window)
                 } else {
-                    return Either::Left(None)
+                    return Ok(Either::Left(None))
                 }
             } else {
-                return Either::Left(None)
+                return Ok(Either::Left(None))
             };
 
         self.send_outgoing(frame).await?;
-        Either::Left(None)
+        Ok(Either::Left(None))
     }
 
-    #[throws(ConnectionError)]
-    async fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Either<Option<Frame<GoAway>>, StreamId> {
+    async fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Result<Either<Option<Frame<GoAway>>, Stream>> {
         let stream_id = frame.header().stream_id();
 
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.update_state(State::Closed).await
+                s.shared().await.update_state(State::Closed)
             }
-            return Either::Left(None)
+            return Ok(Either::Left(None))
         }
 
         let is_finish = frame.header().flags().contains(FIN); // half-close
@@ -317,32 +364,33 @@ where
         if frame.header().flags().contains(SYN) { // new stream
             if !self.is_valid_remote_id(stream_id, Tag::WindowUpdate) {
                 log::error!("{}: {}: invalid stream id", self.id, stream_id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             if self.streams.contains_key(&stream_id.val()) {
                 log::error!("{}: {}: stream already exists", self.id, stream_id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             if self.streams.len() == self.config.max_num_streams {
                 log::error!("{}: maximum number of streams reached", self.id);
-                return Either::Left(Some(Frame::protocol_error()))
+                return Ok(Either::Left(Some(Frame::protocol_error())))
             }
             let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, frame.header().credit(), self.cmd_sender.clone());
             if is_finish {
-                stream.update_state(State::RecvClosed).await
+                stream.shared().await.update_state(State::RecvClosed)
             }
-            self.streams.insert(stream_id.val(), stream);
-            return Either::Right(stream_id)
+            self.streams.insert(stream_id.val(), stream.clone());
+            return Ok(Either::Right(stream))
         }
 
         if let Some(stream) = self.streams.get_mut(&stream_id.val()) {
-            stream.credit += frame.header().credit();
+            let mut shared = stream.shared().await;
+            shared.credit += frame.header().credit();
             if is_finish {
-                stream.update_state(State::RecvClosed).await
+                shared.update_state(State::RecvClosed)
             }
         }
 
-        Either::Left(None)
+        Ok(Either::Left(None))
     }
 
     fn on_ping(&mut self, frame: &Frame<Ping>) -> Option<Frame<Ping>> {
@@ -362,71 +410,42 @@ where
         None
     }
 
-    #[throws(ConnectionError)]
-    async fn reset(&mut self, id: StreamId) {
-        if let Some(stream) = self.streams.remove(&id.val()) {
-            if stream.state() == State::Closed {
-                return
+    async fn reset(&mut self, id: StreamId) -> Result<()> {
+        if let Some(mut stream) = self.streams.remove(&id.val()) {
+            if stream.shared().await.state() == State::Closed {
+                return Ok(())
             }
         } else {
-            return
+            return Ok(())
         }
         log::debug!("{}: {}: resetting stream of {:?}", self.id, id, self);
         let mut header = Header::data(id, 0);
         header.rst();
-        self.send_outgoing(Frame::new(header)).await?
+        self.send_outgoing(Frame::new(header)).await?;
+        Ok(())
     }
 
-    #[throws(ConnectionError)]
-    async fn finish(&mut self, id: StreamId) {
+    async fn finish(&mut self, id: StreamId) -> Result<()> {
         let frame =
             if let Some(stream) = self.streams.get_mut(&id.val()) {
-                if stream.state().can_write() {
+                let mut shared = stream.shared().await;
+                if shared.state().can_write() {
                     log::debug!("{}: {}: finish stream", self.id, id);
-                    stream.update_state(State::SendClosed).await;
+                    shared.update_state(State::SendClosed);
                     let mut header = Header::data(id, 0);
                     header.fin();
                     Frame::new(header)
                 } else {
-                    return
+                    return Ok(())
                 }
             } else {
-                return
+                return Ok(())
             };
-        self.send_outgoing(frame).await?
+        self.send_outgoing(frame).await?;
+        Ok(())
     }
 }
 
-///// A handle to a multiplexed stream.
-//#[derive(Debug)]
-//pub struct StreamHandle {
-//    id: StreamId,
-//    buffer: Arc<Mutex<Chunks>>,
-//    outgoing: mpsc::Sender<Command>
-//}
-//
-//impl StreamHandle {
-//    fn new(id: StreamId, buffer: Arc<Mutex<Chunks>>, out: mpsc::Sender<Command>) -> Self {
-//        StreamHandle { id, buffer, outgoing: out }
-//    }
-//
-//    /// Report how much sending credit this stream has available.
-//    pub fn credit(&self) -> Option<u32> {
-//        self.connection.inner.lock().streams.get(&self.id).map(|s| s.credit)
-//    }
-//}
-//
-//impl<T> Drop for StreamHandle<T>
-//where
-//    T: AsyncRead + AsyncWrite
-//{
-//    fn drop(&mut self) {
-//        let mut inner = self.connection.inner.lock();
-//        log::debug!("{}: {}: dropping stream", inner.id, self.id);
-//        let _ = inner.reset(self.id);
-//    }
-//}
-//
 //impl<T> io::Read for StreamHandle<T>
 //where
 //    T: AsyncRead + AsyncWrite

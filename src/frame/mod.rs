@@ -11,7 +11,6 @@
 pub mod header;
 
 use bytes::BytesMut;
-use fehler::throws;
 use header::{Header, StreamId, Data, WindowUpdate, GoAway};
 use std::{convert::TryInto, io};
 use thiserror::Error;
@@ -46,12 +45,11 @@ impl<T> Frame<T> {
 }
 
 impl Frame<Data> {
-    #[throws]
-    pub fn data(id: StreamId, b: BytesMut) -> Self {
-        Frame {
+    pub fn data(id: StreamId, b: BytesMut) -> Result<Self, anyhow::Error> {
+        Ok(Frame {
             header: Header::data(id, b.len().try_into()?),
             body: b
-        }
+        })
     }
 
     pub fn body(&self) -> &BytesMut {
@@ -122,11 +120,10 @@ impl Encoder for Codec {
     type Item = Frame<()>;
     type Error = io::Error;
 
-    #[throws(Self::Error)]
-    fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) {
+    fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) -> Result<(), Self::Error> {
         let header = self.header_codec.encode(&frame.header);
         bytes.extend_from_slice(&header);
-        self.body_codec.encode(frame.body.freeze(), bytes)?
+        Ok(self.body_codec.encode(frame.body.freeze(), bytes)?)
     }
 }
 
@@ -134,11 +131,10 @@ impl Decoder for Codec {
     type Item = Frame<()>;
     type Error = DecodeError;
 
-    #[throws(DecodeError)]
-    fn decode(&mut self, src: &mut BytesMut) -> Option<Self::Item> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if self.header.is_none() {
             if src.len() < header::HEADER_SIZE {
-                return None
+                return Ok(None)
             }
             let mut b: [u8; header::HEADER_SIZE] = [0; header::HEADER_SIZE];
             b.copy_from_slice(&src.split_to(header::HEADER_SIZE));
@@ -147,12 +143,12 @@ impl Decoder for Codec {
 
         if let Some(header) = self.header.take() {
             if header.tag() != header::Tag::Data {
-                return Some(Frame { header, body: BytesMut::new() })
+                return Ok(Some(Frame { header, body: BytesMut::new() }))
             }
             let len = crate::u32_as_usize(header.len().val());
             if len <= src.len() {
                 if let Some(body) = self.body_codec.decode(&mut src.split_to(len))? {
-                    return Some(Frame { header, body })
+                    return Ok(Some(Frame { header, body }))
                 }
             } else {
                 let add = len - src.len();
@@ -161,7 +157,7 @@ impl Decoder for Codec {
             self.header = Some(header)
         }
 
-        None
+        Ok(None)
     }
 }
 

@@ -8,7 +8,6 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use fehler::{throw, throws};
 use std::fmt;
 use thiserror::Error;
 
@@ -337,10 +336,9 @@ impl Codec {
         buf
     }
 
-    #[throws(DecodeError)]
-    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Header<T> {
+    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Result<Header<T>, DecodeError> {
         if buf[0] != 0 {
-            throw!(DecodeError::Version(buf[0]))
+            return Err(DecodeError::Version(buf[0]))
         }
 
         let hdr = Header {
@@ -350,7 +348,7 @@ impl Codec {
                 1 => Tag::WindowUpdate,
                 2 => Tag::Ping,
                 3 => Tag::GoAway,
-                t => throw!(DecodeError::Type(t))
+                t => return Err(DecodeError::Type(t))
             },
             flags: Flags(u16::from_be_bytes([buf[2], buf[3]])),
             stream_id: StreamId(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
@@ -361,15 +359,15 @@ impl Codec {
         if Tag::Data == hdr.tag {
             let len = crate::u32_as_usize(hdr.length.0);
             if len > self.max_body_len {
-                throw!(DecodeError::FrameTooLarge(len))
+                return Err(DecodeError::FrameTooLarge(len))
             }
         }
 
         if hdr.flags.0 > MAX_FLAG_VAL {
-            throw!(DecodeError::Flags(hdr.flags.0))
+            return Err(DecodeError::Flags(hdr.flags.0))
         }
 
-        hdr
+        Ok(hdr)
     }
 }
 
