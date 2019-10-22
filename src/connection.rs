@@ -15,6 +15,7 @@ use crate::{
     DEFAULT_CREDIT,
     WindowUpdateMode,
     chunks::Chunks,
+    compat,
     error::ConnectionError,
     frame::{
         self,
@@ -36,7 +37,7 @@ use crate::{
     }
 };
 use either::Either;
-use futures::{channel::{mpsc, oneshot}, lock::Mutex, prelude::*, stream::SplitSink};
+use futures::{channel::{mpsc, oneshot}, lock::Mutex, prelude::*, stream::Fuse};
 use nohash_hasher::IntMap;
 use std::{fmt, pin::Pin, sync::Arc};
 use tokio_codec::Framed;
@@ -72,57 +73,49 @@ impl fmt::Display for Id {
     }
 }
 
-/// Connection events.
+/// Connection commands.
 #[derive(Debug)]
-pub(crate) enum Event {
-    /// A new frame as been decoded from remote.
-    InboundFrame(std::result::Result<Frame<()>, frame::DecodeError>),
-    /// A new frame should be sent to remote.
-    OutboundFrame(Frame<()>),
+pub(crate) enum Command {
     /// Open a new stream to remote.
-    OpenStream(oneshot::Sender<Stream>),
+    Open(oneshot::Sender<Stream>),
+    /// A new frame should be sent to remote.
+    Send(Frame<()>),
     /// Flush the socket.
-    FlushConnection,
+    Flush,
     /// Close the connection.
-    CloseConnection(oneshot::Sender<()>)
+    Close(oneshot::Sender<()>)
 }
 
 /// Connection controller.
 #[derive(Clone)]
-pub struct Control(mpsc::Sender<Event>);
+pub struct Control(mpsc::Sender<Command>);
 
 impl Control {
     /// Open a new stream to the remote.
     pub async fn open_stream(&mut self) -> Result<Stream> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Event::OpenStream(tx)).await?;
+        self.0.send(Command::Open(tx)).await?;
         Ok(rx.await?)
     }
 
     /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Event::CloseConnection(tx)).await?;
+        self.0.send(Command::Close(tx)).await?;
         Ok(rx.await?)
     }
 }
-
-/// A stream of incoming events.
-type Incoming = Pin<Box<dyn futures::stream::Stream<Item = Result<Event>>>>;
-
-/// A sink of outgoing frames.
-type Outgoing<T> = SplitSink<Framed<crate::compat::AioCompat<T>, frame::Codec>, Frame<()>>;
 
 /// A yamux connection object.
 pub struct Connection<T> {
     id: Id,
     mode: Mode,
     config: Config,
-    outgoing: Outgoing<T>,
-    incoming: Incoming,
+    socket: Fuse<Framed<compat::AioCompat<T>, frame::Codec>>,
     next_id: u32,
     streams: IntMap<u32, Stream>,
-    cmd_sender: mpsc::Sender<Event>
+    sender: mpsc::Sender<Command>,
+    receiver: mpsc::Receiver<Command>
 }
 
 impl<T> fmt::Debug for Connection<T> {
@@ -144,30 +137,26 @@ where
         let id = Id(rand::random());
         log::debug!("new connection: id = {}, mode = {:?}", id, mode);
 
-        let socket = crate::compat::AioCompat(socket);
-        let (cmd_sender, cmd_receiver) = mpsc::channel(cfg.max_pending_frames);
+        let (sender, receiver) = mpsc::channel(cfg.max_pending_frames);
 
-        let (outgoing, incoming) = {
-            let (sink, stream) = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).split();
-            let stream = stream.map_ok(|f| Event::InboundFrame(Ok(f))).err_into();
-            (sink, Box::pin(futures::stream::select(cmd_receiver.map(Ok), stream).fuse()))
-        };
+        let socket = compat::AioCompat(socket);
+        let socket = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).fuse();
 
         let conn = Connection {
             id,
             mode,
             config: cfg,
-            outgoing,
-            incoming,
+            socket,
             streams: IntMap::default(),
-            cmd_sender: cmd_sender.clone(),
+            sender: sender.clone(),
+            receiver,
             next_id: match mode {
                 Mode::Client => 1,
                 Mode::Server => 2
             }
         };
 
-        (conn, Control(cmd_sender))
+        (conn, Control(sender))
     }
 
     /// Get the next incoming stream, opened by the remote.
@@ -175,50 +164,51 @@ where
     /// This must be called continously in order to make progress.
     /// Once, `None` is returned the connection is closed.
     pub async fn incoming_stream(&mut self) -> Result<Option<Stream>> {
-        while let Some(event) = self.incoming.try_next().await? {
-            match event {
-                Event::InboundFrame(Err(e)) => return Err(e.into()),
-                Event::InboundFrame(Ok(frame)) => {
-                    match self.on_frame(frame).await? {
-                        Either::Left(None) => (),
-                        Either::Left(Some(response)) => self.send_outgoing(response).await?,
-                        Either::Right(stream) => {
-                            debug_assert!(self.streams.contains_key(&stream.id().val()));
-                            debug_assert!(stream.strong_count() > 1);
-                            return Ok(Some(stream))
-                        }
+        loop {
+            futures::select! {
+                command = self.receiver.next() => {
+                    match command {
+                        Some(Command::Open(reply)) => {}
+                        Some(Command::Send(frame)) => self.send_outgoing(frame).await?,
+                        Some(Command::Flush) => {}
+                        Some(Command::Close(reply)) => {}
+                        None => break
                     }
+                },
+                frame = self.socket.next() => {
+                    match frame {
+                        Some(Ok(frame)) => {
+                            match self.on_frame(frame).await? {
+                                Either::Left(None) => (),
+                                Either::Left(Some(response)) => self.send_outgoing(response).await?,
+                                Either::Right(stream) => {
+                                    debug_assert!(self.streams.contains_key(&stream.id().val()));
+                                    debug_assert!(stream.strong_count() > 1);
+                                    return Ok(Some(stream))
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Err(e.into()),
+                        None => break
+                    }
+                    // Remove stale streams.
+                    let conn_id = self.id;
+                    self.streams.retain(|id, stream| {
+                        if stream.strong_count() == 1 {
+                            log::trace!("{}: removing dropped stream {}", conn_id, id);
+                            return false
+                        }
+                        true
+                    })
                 }
-                Event::OpenStream(reply) => {}
-                Event::OutboundFrame(frame) => self.send_outgoing(frame).await?,
-                Event::FlushConnection => {}
-                Event::CloseConnection(reply) => {}
+                complete => break
             }
-            // Remove stale streams.
-            let conn_id = self.id;
-            self.streams.retain(|id, stream| {
-                if stream.strong_count() == 1 {
-                    log::trace!("{}: removing dropped stream {}", conn_id, id);
-                    return false
-                }
-                true
-            })
         }
         Ok(None)
     }
 
-    pub fn into_stream(self) -> impl futures::stream::Stream<Item = Result<Stream>> {
-        futures::stream::unfold(self, |mut this| async move {
-            match this.incoming_stream().await {
-                Ok(Some(s)) => Some((Ok(s), this)),
-                Ok(None) => None,
-                Err(e) => Some((Err(e), this))
-            }
-        })
-    }
-
     async fn send_outgoing<A>(&mut self, f: Frame<A>) -> Result<()> {
-        if let Err(e) = self.outgoing.send(f.cast()).await {
+        if let Err(e) = self.socket.send(f.cast()).await {
             log::debug!("{}: connection closed", self.id);
             self.kill().await;
             return Err(e.into())
@@ -299,7 +289,7 @@ where
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Ok(Either::Left(Some(Frame::internal_error())))
             }
-            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.cmd_sender.clone());
+            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.sender.clone());
             {
                 let mut shared = stream.shared().await;
                 if is_finish {
@@ -374,7 +364,7 @@ where
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Ok(Either::Left(Some(Frame::protocol_error())))
             }
-            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, frame.header().credit(), self.cmd_sender.clone());
+            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, frame.header().credit(), self.sender.clone());
             if is_finish {
                 stream.shared().await.update_state(State::RecvClosed)
             }

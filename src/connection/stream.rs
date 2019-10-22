@@ -11,7 +11,7 @@
 use crate::{chunks::Chunks, frame::header::StreamId};
 use futures::{channel::mpsc, lock::{Mutex, MutexGuard}};
 use std::sync::Arc;
-use super::Event;
+use super::Command;
 
 /// The state of a stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -50,12 +50,12 @@ impl State {
 #[derive(Clone, Debug)]
 pub struct Stream {
     id: StreamId,
-    sender: mpsc::Sender<Event>,
+    sender: mpsc::Sender<Command>,
     shared: Arc<Mutex<Shared>>
 }
 
 impl Stream {
-    pub(crate) fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<Event>) -> Self {
+    pub(crate) fn new(id: StreamId, window: u32, credit: u32, sender: mpsc::Sender<Command>) -> Self {
         Stream {
             id,
             shared: Arc::new(Mutex::new(Shared::new(window, credit))),

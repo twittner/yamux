@@ -17,6 +17,8 @@
 //! `Connection` implements `futures::Stream` yielding `StreamHandle`s for inbound connection
 //! attempts.
 
+#![recursion_limit = "256"]
+
 mod chunks;
 mod compat;
 mod connection;
