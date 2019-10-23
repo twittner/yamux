@@ -38,7 +38,7 @@ use crate::{
 use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
 use nohash_hasher::IntMap;
-use std::fmt;
+use std::{fmt, sync::Arc};
 use tokio_codec::Framed;
 
 pub use stream::{State, Stream};
@@ -74,20 +74,22 @@ impl fmt::Display for Id {
 
 /// Controller of [`Connection`].
 #[derive(Clone)]
-pub struct RemoteControl(mpsc::Sender<Command>);
+pub struct RemoteControl {
+    sender: mpsc::Sender<Command>
+}
 
 impl RemoteControl {
     /// Open a new stream to the remote.
     pub async fn open_stream(&mut self) -> Result<Stream> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Command::Open(tx)).await?;
-        Ok(rx.await?)
+        self.sender.send(Command::Open(tx)).await?;
+        rx.await?
     }
 
     /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Command::Close(Either::Right(tx))).await?;
+        self.sender.send(Command::Close(Either::Right(tx))).await?;
         Ok(rx.await?)
     }
 }
@@ -96,7 +98,7 @@ impl RemoteControl {
 pub struct Connection<T> {
     id: Id,
     mode: Mode,
-    config: Config,
+    config: Arc<Config>,
     socket: Fuse<Framed<compat::AioCompat<T>, frame::Codec>>,
     next_id: u32,
     streams: IntMap<u32, Stream>,
@@ -108,9 +110,9 @@ pub struct Connection<T> {
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Open a new stream to remote.
-    Open(oneshot::Sender<Stream>),
+    Open(oneshot::Sender<Result<Stream>>),
     /// A new frame should be sent to remote.
-    Send(Frame<Data>),
+    Send(Frame<()>),
     /// Flush the socket.
     Flush,
     /// Close the stream or the connection.
@@ -155,7 +157,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         Connection {
             id,
             mode,
-            config: cfg,
+            config: Arc::new(cfg),
             socket,
             streams: IntMap::default(),
             sender,
@@ -169,7 +171,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
 
     /// Get a controller to control this connection.
     pub fn remote_control(&self) -> RemoteControl {
-        RemoteControl(self.sender.clone())
+        RemoteControl {
+            sender: self.sender.clone()
+        }
     }
 
     /// Get the next incoming stream, opened by the remote.
@@ -178,103 +182,108 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// Once `Ok(None)` is returned the connection is closed and
     /// no further invocations of this method should be attempted.
     pub async fn next(&mut self) -> Result<Option<Stream>> {
+        let result = self.get_next().await;
+
+        match &result {
+            Ok(Some(_)) => return result,
+            Ok(None) => log::debug!("{}: eof", self.id),
+            Err(e) => log::error!("{}: connection error: {}", self.id, e)
+        }
+
+        for (_, s) in self.streams.drain() {
+            let mut shared = s.shared();
+            shared.update_state(State::Closed);
+            if let Some(w) = shared.waker.take() {
+                w.wake()
+            }
+        }
+
+        self.socket.close().await?;
+        result
+    }
+
+    async fn get_next(&mut self) -> Result<Option<Stream>> {
         loop {
+            // Remove stale streams on each iteration.
+            // If we ever get async. destructors we can replace this with
+            // streams sending a close command on drop.
+            let conn_id = self.id;
+            self.streams.retain(|id, stream| {
+                if stream.strong_count() == 1 {
+                    log::trace!("{}: removing dropped stream {}", conn_id, id);
+                    return false
+                }
+                true
+            });
             futures::select! {
+                // Handle commands from remote control or our own streams.
                 command = self.receiver.next() => match command {
-                    Some(Command::Open(reply)) => {}
-                    Some(Command::Send(frame)) => self.send(frame).await?,
-                    Some(Command::Flush) => self.flush().await?,
+                    // Open a new stream.
+                    Some(Command::Open(reply)) => {
+                        if self.streams.len() >= self.config.max_num_streams {
+                            log::error!("{}: maximum number of streams reached", self.id);
+                            let _ = reply.send(Err(ConnectionError::TooManyStreams));
+                            continue
+                        }
+                        let id = self.next_stream_id()?;
+                        let mut frame = Frame::window_update(id, self.config.receive_window);
+                        frame.header_mut().syn();
+                        self.socket.send(frame.cast()).await?;
+                        let sender = self.sender.clone();
+                        let config = self.config.clone();
+                        let window = self.config.receive_window;
+                        let stream = Stream::new(id, config, window, DEFAULT_CREDIT, sender);
+                        self.streams.insert(id.val(), stream.clone());
+                        log::debug!("{}: {}: outgoing stream of {:?}", self.id, id, self);
+                        let _ = reply.send(Ok(stream));
+                    }
+                    // Send a frame from one of our own streams.
+                    Some(Command::Send(frame)) => self.socket.send(frame).await?,
+                    // Flush the connection.
+                    Some(Command::Flush) => self.socket.flush().await?,
+                    // Close a stream.
                     Some(Command::Close(Either::Left(id))) =>
                         if self.streams.contains_key(&id.val()) {
                             let mut header = Header::data(id, 0);
                             header.fin();
-                            self.send(Frame::new(header)).await?
+                            self.socket.send(Frame::new(header).cast()).await?
                         }
-                    Some(Command::Close(Either::Right(reply))) => {}
-                    None => break
-                },
-                frame = self.socket.try_next() => {
-                    match frame {
-                        Ok(Some(frame)) => {
-                            match self.on_frame(frame) {
-                                Action::None => continue,
-                                Action::New(stream) => return Ok(Some(stream)),
-                                Action::Update(frame) => self.send(frame).await?,
-                                Action::Ping(frame) => self.send(frame).await?,
-                                Action::Reset(frame) => self.send(frame).await?,
-                                Action::Terminate(frame) => self.send(frame).await?
-                            }
-                            self.flush().await?
-                        }
-                        Ok(None) => break,
-                        Err(e) => return Err(e.into())
+                    // Close the whole connection.
+                    Some(Command::Close(Either::Right(reply))) => {
+                        self.socket.send(Frame::term().cast()).await?;
+                        let _ = reply.send(());
+                        break
                     }
-                    // Remove stale streams.
-                    let conn_id = self.id;
-                    self.streams.retain(|id, stream| {
-                        if stream.strong_count() == 1 {
-                            log::trace!("{}: removing dropped stream {}", conn_id, id);
-                            return false
+                    // The remote control and all our streams are gone, so terminate.
+                    None => {
+                        self.socket.send(Frame::term().cast()).await?;
+                        break
+                    }
+                },
+
+                // Handle incoming frames from the remote.
+                frame = self.socket.try_next() => match frame {
+                    Ok(Some(frame)) => {
+                        if frame.header().tag() == Tag::GoAway {
+                            break
                         }
-                        true
-                    })
+                        match self.on_frame(frame) {
+                            Action::None => continue,
+                            Action::New(stream) => return Ok(Some(stream)),
+                            Action::Update(frame) => self.socket.send(frame.cast()).await?,
+                            Action::Ping(frame) => self.socket.send(frame.cast()).await?,
+                            Action::Reset(frame) => self.socket.send(frame.cast()).await?,
+                            Action::Terminate(frame) => self.socket.send(frame.cast()).await?
+                        }
+                        self.socket.flush().await?
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e.into())
                 }
-                complete => break
             }
         }
+
         Ok(None)
-    }
-
-    async fn send<A>(&mut self, f: Frame<A>) -> Result<()> {
-        if let Err(e) = self.socket.send(f.cast()).await {
-            log::debug!("{}: error sending frame: {}", self.id, e);
-            self.kill();
-            return Err(e.into())
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<()> {
-        if let Err(e) = self.socket.flush().await {
-            log::debug!("{}: error flushing socket: {}", self.id, e);
-            self.kill();
-            return Err(e.into())
-        }
-        Ok(())
-    }
-
-    fn kill(&mut self) {
-        log::debug!("{}: destroying connection", self.id);
-        for s in self.streams.values_mut() {
-            let mut shared = s.shared();
-            shared.update_state(State::Closed);
-            if let Some(w) = shared.reader.take() {
-                w.wake()
-            }
-            if let Some(w) = shared.writer.take() {
-                w.wake()
-            }
-        }
-    }
-
-    fn next_stream_id(&mut self) -> Result<StreamId> {
-        let proposed = StreamId::new(self.next_id);
-        self.next_id = self.next_id.checked_add(2).ok_or(ConnectionError::NoMoreStreamIds)?;
-        match self.mode {
-            Mode::Client => assert!(proposed.is_client()),
-            Mode::Server => assert!(proposed.is_server())
-        }
-        Ok(proposed)
-    }
-
-    fn is_valid_remote_id(&self, id: StreamId, tag: Tag) -> bool {
-        if tag == Tag::Ping || tag == Tag::GoAway {
-            return id.is_session()
-        }
-        match self.mode {
-            Mode::Client => id.is_server(),
-            Mode::Server => id.is_client()
-        }
     }
 
     fn on_frame<A>(&mut self, frame: Frame<A>) -> Action {
@@ -282,10 +291,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             Tag::Data => self.on_data(frame.cast()),
             Tag::WindowUpdate => self.on_window_update(&frame.cast()),
             Tag::Ping => self.on_ping(&frame.cast()),
-            Tag::GoAway => {
-                self.kill();
-                Action::None
-            }
+            Tag::GoAway => Action::None
         }
     }
 
@@ -319,7 +325,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Action::Terminate(Frame::internal_error())
             }
-            let stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.sender.clone());
+            let sender = self.sender.clone();
+            let config = self.config.clone();
+            let stream = Stream::new(stream_id, config, DEFAULT_CREDIT, DEFAULT_CREDIT, sender);
             {
                 let mut shared = stream.shared();
                 if is_finish {
@@ -350,6 +358,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
             shared.window = shared.window.saturating_sub(frame.body().len() as u32);
             shared.buffer.push(frame.into_body());
+            if let Some(w) = shared.waker.take() {
+                w.wake()
+            }
             if !is_finish
                 && shared.window == 0
                 && self.config.window_update_mode == WindowUpdateMode::OnReceive
@@ -391,7 +402,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 return Action::Terminate(Frame::protocol_error())
             }
             let credit = frame.header().credit();
-            let stream = Stream::new(stream_id, DEFAULT_CREDIT, credit, self.sender.clone());
+            let config = self.config.clone();
+            let stream = Stream::new(stream_id, config, DEFAULT_CREDIT, credit, self.sender.clone());
             if is_finish {
                 stream.shared().update_state(State::RecvClosed)
             }
@@ -405,7 +417,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             if is_finish {
                 shared.update_state(State::RecvClosed)
             }
-            if let Some(w) = shared.writer.take() {
+            if let Some(w) = shared.waker.take() {
                 w.wake()
             }
         }
@@ -425,6 +437,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
         log::debug!("{}: {}: received ping for unknown stream", self.id, stream_id);
         Action::None
+    }
+
+    // Get the next valid stream ID.
+    fn next_stream_id(&mut self) -> Result<StreamId> {
+        let proposed = StreamId::new(self.next_id);
+        self.next_id = self.next_id.checked_add(2).ok_or(ConnectionError::NoMoreStreamIds)?;
+        match self.mode {
+            Mode::Client => assert!(proposed.is_client()),
+            Mode::Server => assert!(proposed.is_server())
+        }
+        Ok(proposed)
+    }
+
+    // Check if the given stream ID is valid w.r.t. the provided tag and our connection mode.
+    fn is_valid_remote_id(&self, id: StreamId, tag: Tag) -> bool {
+        if tag == Tag::Ping || tag == Tag::GoAway {
+            return id.is_session()
+        }
+        match self.mode {
+            Mode::Client => id.is_server(),
+            Mode::Server => id.is_client()
+        }
     }
 }
 

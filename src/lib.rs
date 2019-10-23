@@ -17,7 +17,7 @@
 //! `Connection` implements `futures::Stream` yielding `StreamHandle`s for inbound connection
 //! attempts.
 
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 mod chunks;
 mod compat;
@@ -92,40 +92,46 @@ impl Default for Config {
 
 impl Config {
     /// Set the receive window (must be >= 256 KiB).
-    pub fn set_receive_window(&mut self, n: u32) -> Result<(), ()> {
-        if n >= DEFAULT_CREDIT {
-            self.receive_window = n;
-            return Ok(())
-        }
-        Err(())
+    ///
+    /// # Panics
+    ///
+    /// If the given receive window is < 256 KiB.
+    pub fn set_receive_window(&mut self, n: u32) -> &mut Self {
+        assert!(n >= DEFAULT_CREDIT);
+        self.receive_window = n;
+        self
     }
 
     /// Set the max. buffer size per stream.
-    pub fn set_max_buffer_size(&mut self, n: usize) {
-        self.max_buffer_size = n
+    pub fn set_max_buffer_size(&mut self, n: usize) -> &mut Self {
+        self.max_buffer_size = n;
+        self
     }
 
     /// Set the max. number of streams.
-    pub fn set_max_num_streams(&mut self, n: usize) {
-        self.max_num_streams = n
+    pub fn set_max_num_streams(&mut self, n: usize) -> &mut Self {
+        self.max_num_streams = n;
+        self
     }
 
     /// Set the max. number of pending frames, i.e. outgoing
     /// frames which have not yet been sent.
-    pub fn set_max_pending_frames(&mut self, n: usize) {
-        self.max_pending_frames = n
+    pub fn set_max_pending_frames(&mut self, n: usize) -> &mut Self {
+        self.max_pending_frames = n;
+        self
     }
 
-
     /// Set the window update mode to use.
-    pub fn set_window_update_mode(&mut self, m: WindowUpdateMode) {
-        self.window_update_mode = m
+    pub fn set_window_update_mode(&mut self, m: WindowUpdateMode) -> &mut Self {
+        self.window_update_mode = m;
+        self
     }
 
     /// Allow or disallow streams to read from buffered data after
     /// the connection has been closed.
-    pub fn set_read_after_close(&mut self, b: bool) {
+    pub fn set_read_after_close(&mut self, b: bool) -> &mut Self {
         self.read_after_close = b;
+        self
     }
 }
 
