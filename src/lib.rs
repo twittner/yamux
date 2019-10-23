@@ -17,13 +17,13 @@
 //! `Connection` implements `futures::Stream` yielding `StreamHandle`s for inbound connection
 //! attempts.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod chunks;
 mod compat;
 mod connection;
 mod error;
-mod frame;
+pub mod frame;
 
 pub use crate::connection::{Connection, Mode, Stream, State};
 pub use crate::error::ConnectionError;

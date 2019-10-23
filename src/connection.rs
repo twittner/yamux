@@ -35,6 +35,7 @@ use crate::{
         }
     }
 };
+use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
 use nohash_hasher::IntMap;
 use std::fmt;
@@ -86,7 +87,7 @@ impl RemoteControl {
     /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.0.send(Command::Close(tx)).await?;
+        self.0.send(Command::Close(Either::Right(tx))).await?;
         Ok(rx.await?)
     }
 }
@@ -109,11 +110,11 @@ pub(crate) enum Command {
     /// Open a new stream to remote.
     Open(oneshot::Sender<Stream>),
     /// A new frame should be sent to remote.
-    Send(Frame<()>),
+    Send(Frame<Data>),
     /// Flush the socket.
     Flush,
-    /// Close the connection.
-    Close(oneshot::Sender<()>)
+    /// Close the stream or the connection.
+    Close(Either<StreamId, oneshot::Sender<()>>)
 }
 
 /// Possible actions as a result of incoming frame handling.
@@ -183,13 +184,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     Some(Command::Open(reply)) => {}
                     Some(Command::Send(frame)) => self.send(frame).await?,
                     Some(Command::Flush) => self.flush().await?,
-                    Some(Command::Close(reply)) => {}
+                    Some(Command::Close(Either::Left(id))) =>
+                        if self.streams.contains_key(&id.val()) {
+                            let mut header = Header::data(id, 0);
+                            header.fin();
+                            self.send(Frame::new(header)).await?
+                        }
+                    Some(Command::Close(Either::Right(reply))) => {}
                     None => break
                 },
                 frame = self.socket.try_next() => {
                     match frame {
                         Ok(Some(frame)) => {
-                            match self.on_frame(frame).await {
+                            match self.on_frame(frame) {
                                 Action::None => continue,
                                 Action::New(stream) => return Ok(Some(stream)),
                                 Action::Update(frame) => self.send(frame).await?,
@@ -221,7 +228,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     async fn send<A>(&mut self, f: Frame<A>) -> Result<()> {
         if let Err(e) = self.socket.send(f.cast()).await {
             log::debug!("{}: error sending frame: {}", self.id, e);
-            self.kill().await;
+            self.kill();
             return Err(e.into())
         }
         Ok(())
@@ -230,16 +237,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     async fn flush(&mut self) -> Result<()> {
         if let Err(e) = self.socket.flush().await {
             log::debug!("{}: error flushing socket: {}", self.id, e);
-            self.kill().await;
+            self.kill();
             return Err(e.into())
         }
         Ok(())
     }
 
-    async fn kill(&mut self) {
+    fn kill(&mut self) {
         log::debug!("{}: destroying connection", self.id);
         for s in self.streams.values_mut() {
-            s.shared().await.update_state(State::Closed)
+            let mut shared = s.shared();
+            shared.update_state(State::Closed);
+            if let Some(w) = shared.reader.take() {
+                w.wake()
+            }
+            if let Some(w) = shared.writer.take() {
+                w.wake()
+            }
         }
     }
 
@@ -263,25 +277,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
     }
 
-    async fn on_frame<A>(&mut self, frame: Frame<A>) -> Action {
+    fn on_frame<A>(&mut self, frame: Frame<A>) -> Action {
         match frame.header().tag() {
-            Tag::Data => self.on_data(frame.cast()).await,
-            Tag::WindowUpdate => self.on_window_update(&frame.cast()).await,
+            Tag::Data => self.on_data(frame.cast()),
+            Tag::WindowUpdate => self.on_window_update(&frame.cast()),
             Tag::Ping => self.on_ping(&frame.cast()),
             Tag::GoAway => {
-                self.kill().await;
+                self.kill();
                 Action::None
             }
         }
     }
 
-    async fn on_data(&mut self, frame: Frame<Data>) -> Action {
+    fn on_data(&mut self, frame: Frame<Data>) -> Action {
         let stream_id = frame.header().stream_id();
 
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.shared().await.update_state(State::Closed)
+                s.shared().update_state(State::Closed)
             }
             return Action::None
         }
@@ -294,7 +308,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 return Action::Terminate(Frame::protocol_error())
             }
             if frame.body().len() > crate::u32_as_usize(DEFAULT_CREDIT) {
-                log::error!("{}: {}: initial data for stream exceeds default credit", self.id, stream_id);
+                log::error!("{}: {}: first stream body exceeds default credit", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error())
             }
             if self.streams.contains_key(&stream_id.val()) {
@@ -305,9 +319,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Action::Terminate(Frame::internal_error())
             }
-            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.sender.clone());
+            let stream = Stream::new(stream_id, DEFAULT_CREDIT, DEFAULT_CREDIT, self.sender.clone());
             {
-                let mut shared = stream.shared().await;
+                let mut shared = stream.shared();
                 if is_finish {
                     shared.update_state(State::RecvClosed)
                 }
@@ -319,7 +333,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
 
         if let Some(stream) = self.streams.get_mut(&stream_id.val()) {
-            let mut shared = stream.shared().await;
+            let mut shared = stream.shared();
             if frame.body().len() > crate::u32_as_usize(shared.window) {
                 log::error!("{}: {}: frame body larger than window of stream", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error())
@@ -350,13 +364,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         Action::None
     }
 
-    async fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Action {
+    fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Action {
         let stream_id = frame.header().stream_id();
 
         if frame.header().flags().contains(RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
-                s.shared().await.update_state(State::Closed)
+                s.shared().update_state(State::Closed)
             }
             return Action::None
         }
@@ -376,19 +390,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Action::Terminate(Frame::protocol_error())
             }
-            let mut stream = Stream::new(stream_id, DEFAULT_CREDIT, frame.header().credit(), self.sender.clone());
+            let credit = frame.header().credit();
+            let stream = Stream::new(stream_id, DEFAULT_CREDIT, credit, self.sender.clone());
             if is_finish {
-                stream.shared().await.update_state(State::RecvClosed)
+                stream.shared().update_state(State::RecvClosed)
             }
             self.streams.insert(stream_id.val(), stream.clone());
             return Action::New(stream)
         }
 
         if let Some(stream) = self.streams.get_mut(&stream_id.val()) {
-            let mut shared = stream.shared().await;
+            let mut shared = stream.shared();
             shared.credit += frame.header().credit();
             if is_finish {
                 shared.update_state(State::RecvClosed)
+            }
+            if let Some(w) = shared.writer.take() {
+                w.wake()
             }
         }
 
@@ -408,201 +426,5 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         log::debug!("{}: {}: received ping for unknown stream", self.id, stream_id);
         Action::None
     }
-
-//    async fn finish(&mut self, id: StreamId) -> Result<()> {
-//        let frame =
-//            if let Some(stream) = self.streams.get_mut(&id.val()) {
-//                let mut shared = stream.shared().await;
-//                if shared.state().can_write() {
-//                    log::debug!("{}: {}: finish stream", self.id, id);
-//                    shared.update_state(State::SendClosed);
-//                    let mut header = Header::data(id, 0);
-//                    header.fin();
-//                    Frame::new(header)
-//                } else {
-//                    return Ok(())
-//                }
-//            } else {
-//                return Ok(())
-//            };
-//        self.send(frame).await?;
-//        Ok(())
-//    }
 }
 
-//impl<T> io::Read for StreamHandle<T>
-//where
-//    T: AsyncRead + AsyncWrite
-//{
-//    fn read(&mut self, buf: &mut[u8]) -> io::Result<usize> {
-//        let mut inner = Use::with(self.connection.inner.lock(), Action::Destroy);
-//        if !inner.config.read_after_close && inner.status != ConnStatus::Open {
-//            return Ok(0)
-//        }
-//        loop {
-//            {
-//                let mut n = 0;
-//                let mut buffer = self.buffer.lock();
-//                while let Some(chunk) = buffer.front_mut() {
-//                    if chunk.is_empty() {
-//                        buffer.pop();
-//                        continue
-//                    }
-//                    let k = min(chunk.len(), buf.len() - n);
-//                    (&mut buf[n .. n + k]).copy_from_slice(&chunk[.. k]);
-//                    n += k;
-//                    chunk.advance(k);
-//                    inner.on_drop(Action::None);
-//                    if n == buf.len() {
-//                        break
-//                    }
-//                }
-//                if n > 0 {
-//                    return Ok(n)
-//                }
-//                let can_read = inner.streams.get(&self.id).map(|s| s.state().can_read());
-//                if !can_read.unwrap_or(false) {
-//                    log::debug!("{}: {}: can no longer read", inner.id, self.id);
-//                    inner.on_drop(Action::None);
-//                    return Ok(0) // stream has been reset
-//                }
-//            }
-//
-//            if inner.status != ConnStatus::Open {
-//                return Ok(0)
-//            }
-//
-//            if inner.config.window_update_mode == WindowUpdateMode::OnRead {
-//                let inner = &mut *inner;
-//                let frame =
-//                    if let Some(stream) = inner.streams.get_mut(&self.id) {
-//                        if stream.window == 0 {
-//                            log::trace!("{}: {}: read: sending window update", inner.id, self.id);
-//                            stream.window = inner.config.receive_window;
-//                            Some(Frame::window_update(self.id, inner.config.receive_window))
-//                        } else {
-//                            None
-//                        }
-//                    } else {
-//                        None
-//                    };
-//                if let Some(frame) = frame {
-//                    inner.add_pending(frame.into_raw())
-//                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-//                }
-//            }
-//
-//            match inner.process_incoming() {
-//                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-//                Ok(Async::NotReady) => {
-//                    if !self.buffer.lock().is_empty() {
-//                        continue
-//                    }
-//                    inner.on_drop(Action::None);
-//                    let can_read = inner.streams.get(&self.id).map(|s| s.state().can_read());
-//                    if can_read.unwrap_or(false) {
-//                        return Err(io::ErrorKind::WouldBlock.into())
-//                    } else {
-//                        log::debug!("{}: {}: can no longer read", inner.id, self.id);
-//                        return Ok(0) // stream has been reset
-//                    }
-//                }
-//                Ok(Async::Ready(())) => {
-//                    assert!(inner.status != ConnStatus::Open);
-//                    if !inner.config.read_after_close || self.buffer.lock().is_empty() {
-//                        inner.on_drop(Action::None);
-//                        return Ok(0)
-//                    }
-//                }
-//            }
-//        }
-//    }
-//}
-//
-//impl<T> AsyncRead for StreamHandle<T> where T: AsyncRead + AsyncWrite {}
-//
-//impl<T> io::Write for StreamHandle<T>
-//where
-//    T: AsyncRead + AsyncWrite
-//{
-//    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-//        let mut inner = Use::with(self.connection.inner.lock(), Action::Destroy);
-//        if inner.status != ConnStatus::Open {
-//            return Err(io::Error::new(io::ErrorKind::WriteZero, "connection is closed"))
-//        }
-//        match inner.process_incoming() {
-//            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-//            Ok(Async::NotReady) => {}
-//            Ok(Async::Ready(())) => {
-//                assert!(inner.status != ConnStatus::Open);
-//                return Err(io::Error::new(io::ErrorKind::WriteZero, "connection is closed"))
-//            }
-//        }
-//        inner.on_drop(Action::None);
-//        let frame = match inner.streams.get_mut(&self.id) {
-//            Some(stream) => {
-//                if !stream.state().can_write() {
-//                    log::debug!("{}: {}: can no longer write", inner.id, self.id);
-//                    return Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed"))
-//                }
-//                if stream.credit == 0 {
-//                    inner.tasks.insert_current();
-//                    return Err(io::ErrorKind::WouldBlock.into())
-//                }
-//                let k = min(stream.credit as usize, buf.len());
-//                let b = (&buf[0..k]).into();
-//                stream.credit = stream.credit.saturating_sub(k as u32);
-//                Frame::data(self.id, b).into_raw()
-//            }
-//            None => {
-//                log::debug!("{}: {}: stream is gone, cannot write", inner.id, self.id);
-//                return Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed"))
-//            }
-//        };
-//        let n = frame.body.len();
-//        inner.add_pending(frame).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-//        Ok(n)
-//    }
-//
-//    fn flush(&mut self) -> io::Result<()> {
-//        let mut inner = Use::with(self.connection.inner.lock(), Action::Destroy);
-//        if inner.status != ConnStatus::Open {
-//            return Ok(())
-//        }
-//        match inner.flush_pending() {
-//            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
-//            Ok(Async::NotReady) => {
-//                inner.on_drop(Action::None);
-//                Err(io::ErrorKind::WouldBlock.into())
-//            }
-//            Ok(Async::Ready(())) => {
-//                inner.on_drop(Action::None);
-//                Ok(())
-//            }
-//        }
-//    }
-//}
-//
-//impl<T> AsyncWrite for StreamHandle<T>
-//where
-//    T: AsyncRead + AsyncWrite
-//{
-//    fn shutdown(&mut self) -> Poll<(), io::Error> {
-//        let mut connection = Use::with(self.connection.inner.lock(), Action::Destroy);
-//        if connection.status != ConnStatus::Open {
-//            return Ok(Async::Ready(()))
-//        }
-//        connection.finish(self.id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-//        match connection.flush_pending() {
-//            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
-//            Ok(Async::NotReady) => {
-//                connection.on_drop(Action::None);
-//                Ok(Async::NotReady)
-//            }
-//            Ok(Async::Ready(())) => {
-//                connection.on_drop(Action::None);
-//                Ok(Async::Ready(()))
-//            }
-//        }
-//    }
-//}

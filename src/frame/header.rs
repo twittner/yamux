@@ -174,19 +174,19 @@ impl Header<GoAway> {
 }
 
 /// Data message type.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Data {}
 
 /// Window update message type.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum WindowUpdate {}
 
 /// Ping message type.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Ping {}
 
 /// Go Away message type.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum GoAway {}
 
 /// Types which have a `syn` method.
@@ -269,7 +269,7 @@ impl StreamId {
     }
 
     pub fn is_session(self) -> bool {
-        self.0 == 0
+        self == CONNECTION_ID
     }
 
     pub fn val(self) -> u32 {

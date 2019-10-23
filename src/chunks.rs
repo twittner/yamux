@@ -8,8 +8,6 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-#![allow(unused)]
-
 use bytes::BytesMut;
 use std::collections::VecDeque;
 
@@ -26,10 +24,6 @@ pub struct Chunks {
 impl Chunks {
     pub fn new() -> Self {
         Chunks { seq: VecDeque::new() }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.seq.iter().all(|x| x.is_empty())
     }
 
     pub fn len(&self) -> Option<usize> {

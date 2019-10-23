@@ -8,13 +8,11 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-#![allow(unused)]
-
 pub mod header;
 
 use bytes::BytesMut;
 use header::{Header, StreamId, Data, WindowUpdate, GoAway};
-use std::{convert::TryInto, io};
+use std::{convert::TryInto, io, num::TryFromIntError};
 use thiserror::Error;
 use tokio_codec::{BytesCodec, Decoder, Encoder};
 
@@ -47,7 +45,7 @@ impl<T> Frame<T> {
 }
 
 impl Frame<Data> {
-    pub fn data(id: StreamId, b: BytesMut) -> Result<Self, anyhow::Error> {
+    pub fn data(id: StreamId, b: BytesMut) -> Result<Self, TryFromIntError> {
         Ok(Frame {
             header: Header::data(id, b.len().try_into()?),
             body: b
