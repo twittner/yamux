@@ -9,8 +9,8 @@
 // at https://opensource.org/licenses/MIT.
 
 use crate::{chunks::Chunks, frame::header::StreamId};
-use futures::{channel::mpsc, lock::{Mutex, MutexGuard}};
-use std::sync::Arc;
+use futures::{ready, channel::mpsc, io::{AsyncRead, AsyncWrite}, lock::{Mutex, MutexGuard}};
+use std::{io, pin::Pin, sync::Arc, task::{Context, Poll}};
 use super::Command;
 
 /// The state of a stream.
@@ -63,16 +63,22 @@ impl Stream {
         }
     }
 
-    pub(crate) async fn shared(&mut self) -> MutexGuard<'_, Shared> {
-        self.shared.lock().await
+    pub(crate) fn id(&self) -> StreamId {
+        self.id
     }
 
     pub(crate) fn strong_count(&self) -> usize {
         Arc::strong_count(&self.shared)
     }
 
-    pub(crate) fn id(&self) -> StreamId {
-        self.id
+    pub(crate) async fn shared(&mut self) -> MutexGuard<'_, Shared> {
+        self.shared.lock().await
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        unimplemented!()
     }
 }
 
