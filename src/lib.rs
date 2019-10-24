@@ -8,14 +8,19 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-//! Implementation of [yamux](https://github.com/hashicorp/yamux/blob/master/spec.md), a multiplexer
-//! over reliable, ordered connections, such as TCP/IP.
+//! This crate implements the [Yamux specification][1].
 //!
-//! The two primary objects, clients of this crate interact with, are `Connection` and
-//! `StreamHandle`. The former wraps the underlying connection and multiplexes `StreamHandle`s
-//! which implement `tokio_io::AsyncRead` and `tokio_io::AsyncWrite` over it.
-//! `Connection` implements `futures::Stream` yielding `StreamHandle`s for inbound connection
-//! attempts.
+//! It multiplexes independent I/O streams over reliable, ordered connections,
+//! such as TCP/IP.
+//!
+//! The three primary objects, clients of this crate interact with, are:
+//!
+//! - [`Connection`], which wraps the underlying I/O resource (e.g. a socket),
+//! - [`Stream`], which implements [`futures::io::AsyncRead`] and
+//!   [`futures::io::AsyncWrite`], and
+//! - [`RemoteControl`], to asynchronously control the [`Connection`].
+//!
+//! [1]: https://github.com/hashicorp/yamux/blob/master/spec.md
 
 #![recursion_limit = "1024"]
 
@@ -23,10 +28,11 @@ mod chunks;
 mod compat;
 mod connection;
 mod error;
-pub mod frame;
+mod frame;
 
-pub use crate::connection::{Connection, Mode, Stream, State};
+pub use crate::connection::{Connection, Mode, RemoteControl, Stream, into_stream};
 pub use crate::error::ConnectionError;
+pub use crate::frame::{FrameDecodeError, header::{HeaderDecodeError, StreamId}};
 
 const DEFAULT_CREDIT: u32 = 256 * 1024; // as per yamux specification
 

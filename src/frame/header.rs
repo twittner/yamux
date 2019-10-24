@@ -23,10 +23,6 @@ pub struct Header<T> {
 }
 
 impl<T> Header<T> {
-    pub fn version(&self) -> Version {
-        self.version
-    }
-
     pub fn tag(&self) -> Tag {
         self.tag
     }
@@ -166,11 +162,6 @@ impl Header<GoAway> {
             _marker: std::marker::PhantomData
         }
     }
-
-    /// Get the termination code.
-    pub fn code(&self) -> u32 {
-        self.length.0
-    }
 }
 
 /// Data message type.
@@ -232,12 +223,6 @@ pub enum Tag {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Version(u8);
 
-impl Version {
-    pub fn val(self) -> u8 {
-        self.0
-    }
-}
-
 /// The message length.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Len(u32);
@@ -250,7 +235,8 @@ impl Len {
 
 pub const CONNECTION_ID: StreamId = StreamId(0);
 
-/// The stream ID of a message.
+/// The ID of a stream.
+///
 /// The value 0 denotes no particular stream but the whole session.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId(u32);
@@ -290,10 +276,6 @@ pub struct Flags(u16);
 impl Flags {
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
-    }
-
-    pub fn and(self, other: Flags) -> Flags {
-        Flags(self.0 | other.0)
     }
 }
 
@@ -336,9 +318,9 @@ impl Codec {
         buf
     }
 
-    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Result<Header<T>, DecodeError> {
+    pub fn decode<T>(&self, buf: [u8; HEADER_SIZE]) -> Result<Header<T>, HeaderDecodeError> {
         if buf[0] != 0 {
-            return Err(DecodeError::Version(buf[0]))
+            return Err(HeaderDecodeError::Version(buf[0]))
         }
 
         let hdr = Header {
@@ -348,7 +330,7 @@ impl Codec {
                 1 => Tag::WindowUpdate,
                 2 => Tag::Ping,
                 3 => Tag::GoAway,
-                t => return Err(DecodeError::Type(t))
+                t => return Err(HeaderDecodeError::Type(t))
             },
             flags: Flags(u16::from_be_bytes([buf[2], buf[3]])),
             stream_id: StreamId(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
@@ -359,12 +341,12 @@ impl Codec {
         if Tag::Data == hdr.tag {
             let len = crate::u32_as_usize(hdr.length.0);
             if len > self.max_body_len {
-                return Err(DecodeError::FrameTooLarge(len))
+                return Err(HeaderDecodeError::FrameTooLarge(len))
             }
         }
 
         if hdr.flags.0 > MAX_FLAG_VAL {
-            return Err(DecodeError::Flags(hdr.flags.0))
+            return Err(HeaderDecodeError::Flags(hdr.flags.0))
         }
 
         Ok(hdr)
@@ -373,7 +355,7 @@ impl Codec {
 
 /// Possible errors while decoding a message frame header.
 #[derive(Debug, Error)]
-pub enum DecodeError {
+pub enum HeaderDecodeError {
     /// Unknown version.
     #[error("unknown version: {0}")]
     Version(u8),

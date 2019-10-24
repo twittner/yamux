@@ -57,7 +57,7 @@ impl State {
     }
 }
 
-/// A yamux stream.
+/// A multiplexed Yamux stream.
 #[derive(Debug)]
 pub struct Stream {
     id: StreamId,
@@ -85,6 +85,7 @@ impl Stream {
         }
     }
 
+    /// Get this stream's identifier.
     pub fn id(&self) -> StreamId {
         self.id
     }

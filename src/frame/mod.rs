@@ -11,12 +11,12 @@
 pub mod header;
 
 use bytes::BytesMut;
-use header::{Header, StreamId, Data, WindowUpdate, GoAway};
+use header::{Header, HeaderDecodeError, StreamId, Data, WindowUpdate, GoAway};
 use std::{convert::TryInto, io, num::TryFromIntError};
 use thiserror::Error;
 use tokio_codec::{BytesCodec, Decoder, Encoder};
 
-/// A yamux message frame.
+/// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame<T> {
     header: Header<T>,
@@ -54,10 +54,6 @@ impl Frame<Data> {
 
     pub fn body(&self) -> &BytesMut {
         &self.body
-    }
-
-    pub fn body_mut(&mut self) -> &mut BytesMut {
-        &mut self.body
     }
 
     pub fn into_body(self) -> BytesMut {
@@ -129,7 +125,7 @@ impl Encoder for Codec {
 
 impl Decoder for Codec {
     type Item = Frame<()>;
-    type Error = DecodeError;
+    type Error = FrameDecodeError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if self.header.is_none() {
@@ -163,14 +159,14 @@ impl Decoder for Codec {
 
 /// Possible errors while decoding a message frame.
 #[derive(Debug, Error)]
-pub enum DecodeError {
+pub enum FrameDecodeError {
     /// An I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 
     /// Decoding the frame header failed.
     #[error("decode error: {0}")]
-    Header(#[from] header::DecodeError),
+    Header(#[from] HeaderDecodeError),
 
     #[doc(hidden)]
     #[error("__Nonexhaustive")]

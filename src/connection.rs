@@ -8,6 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+mod control;
 mod stream;
 
 use crate::{
@@ -16,24 +17,8 @@ use crate::{
     WindowUpdateMode,
     compat,
     error::ConnectionError,
-    frame::{
-        self,
-        Frame,
-        header::{
-            ACK,
-            CONNECTION_ID,
-            Data,
-            FIN,
-            GoAway,
-            Header,
-            Ping,
-            RST,
-            SYN,
-            StreamId,
-            Tag,
-            WindowUpdate
-        }
-    }
+    frame::{self, Frame},
+    frame::header::{self, CONNECTION_ID, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate}
 };
 use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
@@ -41,6 +26,7 @@ use nohash_hasher::IntMap;
 use std::{fmt, sync::Arc};
 use tokio_codec::Framed;
 
+pub use control::RemoteControl;
 pub use stream::{State, Stream};
 
 type Result<T> = std::result::Result<T, ConnectionError>;
@@ -54,7 +40,7 @@ pub enum Mode {
     Server
 }
 
-/// The connection ID.
+/// The connection identifier.
 ///
 /// Randomly generated, this is mainly intended to improve log output.
 #[derive(Clone, Copy)]
@@ -72,29 +58,11 @@ impl fmt::Display for Id {
     }
 }
 
-/// Controller of [`Connection`].
-#[derive(Clone)]
-pub struct RemoteControl {
-    sender: mpsc::Sender<Command>
-}
-
-impl RemoteControl {
-    /// Open a new stream to the remote.
-    pub async fn open_stream(&mut self) -> Result<Stream> {
-        let (tx, rx) = oneshot::channel();
-        self.sender.send(Command::Open(tx)).await?;
-        rx.await?
-    }
-
-    /// Close the connection.
-    pub async fn close(&mut self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.sender.send(Command::Close(Either::Right(tx))).await?;
-        Ok(rx.await?)
-    }
-}
-
-/// A yamux connection object.
+/// A Yamux connection object.
+///
+/// Wraps the underlying I/O resource and makes progress via its
+/// [`Connection::next_stream`] method which must be called repeatedly
+/// until `Ok(None)` signals EOF or an error is encountered.
 pub struct Connection<T> {
     id: Id,
     mode: Mode,
@@ -148,6 +116,7 @@ impl<T> fmt::Debug for Connection<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
+    /// Create a new `Connection` from the given I/O resource.
     pub fn new(socket: T, cfg: Config, mode: Mode) -> Self {
         let id = Id(rand::random());
         log::debug!("new connection: id = {}, mode = {:?}", id, mode);
@@ -169,26 +138,29 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
     }
 
-    /// Get a controller to control this connection.
+    /// Get a controller for this connection.
     pub fn remote_control(&self) -> RemoteControl {
-        RemoteControl {
-            sender: self.sender.clone()
-        }
+        RemoteControl::new(self.sender.clone())
     }
 
     /// Get the next incoming stream, opened by the remote.
     ///
-    /// This must be called continously in order to make progress.
-    /// Once `Ok(None)` is returned the connection is closed and
-    /// no further invocations of this method should be attempted.
-    pub async fn next(&mut self) -> Result<Option<Stream>> {
-        let result = self.get_next().await;
+    /// This must be called repeatedly in order to make progress.
+    /// Once `Ok(None)` or `Err(_)` is returned the connection is
+    /// considered closed and no further invocations of this method
+    /// must be attempted.
+    pub async fn next_stream(&mut self) -> Result<Option<Stream>> {
+        let result = self.next().await;
 
         match &result {
             Ok(Some(_)) => return result,
             Ok(None) => log::debug!("{}: eof", self.id),
             Err(e) => log::error!("{}: connection error: {}", self.id, e)
         }
+
+        // At this point we are either at EOF or encountered an error.
+        // We close all streams and wake up the associated tasks before
+        // closing the socket. The connection is then considered closed.
 
         for (_, s) in self.streams.drain() {
             let mut shared = s.shared();
@@ -202,7 +174,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         result
     }
 
-    async fn get_next(&mut self) -> Result<Option<Stream>> {
+    /// The actual implementation of `next_stream`.
+    ///
+    /// It is wrapped in order to guarantee proper closing in case of an
+    /// error or at EOF.
+    async fn next(&mut self) -> Result<Option<Stream>> {
         loop {
             // Remove stale streams on each iteration.
             // If we ever get async. destructors we can replace this with
@@ -286,6 +262,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         Ok(None)
     }
 
+    /// Dispatch frame handling based on the frame's runtime type [`Tag`].
     fn on_frame<A>(&mut self, frame: Frame<A>) -> Action {
         match frame.header().tag() {
             Tag::Data => self.on_data(frame.cast()),
@@ -298,7 +275,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     fn on_data(&mut self, frame: Frame<Data>) -> Action {
         let stream_id = frame.header().stream_id();
 
-        if frame.header().flags().contains(RST) { // stream reset
+        if frame.header().flags().contains(header::RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
                 s.shared().update_state(State::Closed)
@@ -306,9 +283,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             return Action::None
         }
 
-        let is_finish = frame.header().flags().contains(FIN); // half-close
+        let is_finish = frame.header().flags().contains(header::FIN); // half-close
 
-        if frame.header().flags().contains(SYN) { // new stream
+        if frame.header().flags().contains(header::SYN) { // new stream
             if !self.is_valid_remote_id(stream_id, Tag::Data) {
                 log::error!("{}: {}: invalid stream id", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error())
@@ -378,7 +355,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Action {
         let stream_id = frame.header().stream_id();
 
-        if frame.header().flags().contains(RST) { // stream reset
+        if frame.header().flags().contains(header::RST) { // stream reset
             log::debug!("{}: {}: received reset for stream", self.id, stream_id);
             if let Some(s) = self.streams.get_mut(&stream_id.val()) {
                 s.shared().update_state(State::Closed)
@@ -386,9 +363,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             return Action::None
         }
 
-        let is_finish = frame.header().flags().contains(FIN); // half-close
+        let is_finish = frame.header().flags().contains(header::FIN); // half-close
 
-        if frame.header().flags().contains(SYN) { // new stream
+        if frame.header().flags().contains(header::SYN) { // new stream
             if !self.is_valid_remote_id(stream_id, Tag::WindowUpdate) {
                 log::error!("{}: {}: invalid stream id", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error())
@@ -427,7 +404,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
 
     fn on_ping(&mut self, frame: &Frame<Ping>) -> Action {
         let stream_id = frame.header().stream_id();
-        if frame.header().flags().contains(ACK) { // pong
+        if frame.header().flags().contains(header::ACK) { // pong
             return Action::None
         }
         if stream_id == CONNECTION_ID || self.streams.contains_key(&stream_id.val()) {
@@ -460,5 +437,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             Mode::Server => id.is_client()
         }
     }
+}
+
+/// Turn a Yamux [`Connection`] into a [`futures::Stream`].
+pub fn into_stream<T>(c: Connection<T>) -> impl futures::stream::Stream<Item = Result<Stream>>
+where
+    T: AsyncRead + AsyncWrite + Unpin
+{
+    futures::stream::unfold(c, |mut c| async move {
+        match c.next_stream().await {
+            Ok(None) => None,
+            Ok(Some(stream)) => Some((Ok(stream), c)),
+            Err(e) => Some((Err(e), c))
+        }
+    })
 }
 

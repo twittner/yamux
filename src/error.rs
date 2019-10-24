@@ -8,31 +8,31 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::{frame, frame::header::StreamId};
+use crate::frame::FrameDecodeError;
 use thiserror::Error;
 
+/// The various error cases a connection may encounter.
 #[derive(Debug, Error)]
 pub enum ConnectionError {
+    /// An underlying I/O error occured.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Decoding a Yamux message frame failed.
     #[error("decode error: {0}")]
-    Decode(#[from] frame::DecodeError),
+    Decode(#[from] FrameDecodeError),
 
+    /// The whole range of stream IDs has been used up.
     #[error("number of stream ids has been exhausted")]
     NoMoreStreamIds,
 
+    /// An operation fails because the connection is closed.
     #[error("connection is closed")]
     Closed,
 
-    #[error("stream {0} not found")]
-    StreamNotFound(StreamId),
-
+    /// Too many streams are open, so no further ones can be opened at this time.
     #[error("maximum number of streams reached")]
     TooManyStreams,
-
-    #[error("maximum number of pending frames reached")]
-    TooManyPendingFrames,
 
     #[doc(hidden)]
     #[error("__Nonexhaustive")]

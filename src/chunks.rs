@@ -11,11 +11,11 @@
 use bytes::BytesMut;
 use std::collections::VecDeque;
 
-/// A sequence of `BytesMut` values.
+/// A sequence of [`BytesMut`] values.
 ///
-/// [`Chunks::is_empty`] and [`Chunks::len`] consider all `BytesMut` elements
-/// and compute the total result, e.g. the length of all bytes by summing up
-/// the lengths of all `BytesMut` elements.
+/// [`Chunks::len`] considers all [`BytesMut`] elements and computes the total
+/// result, e.g. the length of all bytes by summing up the lengths of all
+/// [`BytesMut`] elements.
 #[derive(Debug)]
 pub struct Chunks {
     seq: VecDeque<BytesMut>

@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! Make futures io traits compatible with tokio_io.
+//! Make futures I/O traits compatible with [`tokio_io`].
 //!
 //! I.e. we map `futures::io::AsyncRead` to `tokio_io::AsyncRead` and
 //! `futures::io::AsyncWrite` to `tokio_io::AsyncWrite`.
@@ -14,6 +14,7 @@
 use futures::io::{AsyncRead, AsyncWrite};
 use std::{io, pin::Pin, task::{Context, Poll}};
 
+/// Newtype to implement `tokio_io::{AsyncRead, AsyncWrite}` on.
 #[derive(Debug)]
 pub(crate) struct AioCompat<T>(pub(crate) T);
 
