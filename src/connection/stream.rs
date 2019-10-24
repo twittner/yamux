@@ -21,7 +21,7 @@ use crate::{
 use either::Either;
 use futures::{ready, channel::mpsc, io::{AsyncRead, AsyncWrite}};
 use parking_lot::{Mutex, MutexGuard};
-use std::{io, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
+use std::{fmt, io, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use super::Command;
 
 /// The state of a Yamux stream.
@@ -58,13 +58,21 @@ impl State {
 }
 
 /// A multiplexed Yamux stream.
-#[derive(Debug)]
 pub struct Stream {
     id: StreamId,
     config: Arc<Config>,
     sender: mpsc::Sender<Command>,
     pending: Option<Frame<WindowUpdate>>,
     shared: Arc<Mutex<Shared>>
+}
+
+impl fmt::Debug for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Stream")
+            .field("id", &self.id.val())
+            .field("pending", &self.pending.is_some())
+            .finish()
+    }
 }
 
 impl Stream {
