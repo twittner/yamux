@@ -379,7 +379,7 @@ pub enum HeaderDecodeError {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::{Arbitrary, Gen, quickcheck};
+    use quickcheck::{Arbitrary, Gen, QuickCheck};
     use rand::{Rng, seq::SliceRandom};
     use super::*;
 
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn encode_decode_identity() {
         fn property(mut hdr: Header<()>, len: u32) -> bool {
-            let mut codec = Codec::new(crate::u32_as_usize(len));
+            let codec = Codec::new(crate::u32_as_usize(len));
             hdr.length = Len(std::cmp::min(hdr.length.0, len));
             let bytes = codec.encode(&hdr);
             match codec.decode(bytes) {
@@ -415,7 +415,9 @@ mod tests {
                 }
             }
         }
-        quickcheck(property as fn(Header<()>, u32) -> bool)
+        QuickCheck::new()
+            .tests(10_000)
+            .quickcheck(property as fn(Header<()>, u32) -> bool)
     }
 }
 

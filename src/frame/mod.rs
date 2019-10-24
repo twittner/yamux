@@ -139,16 +139,18 @@ impl Decoder for Codec {
 
         if let Some(header) = self.header.take() {
             if header.tag() != header::Tag::Data {
-                return Ok(Some(Frame { header, body: BytesMut::new() }))
+                return Ok(Some(Frame::new(header)))
             }
-            let len = crate::u32_as_usize(header.len().val());
-            if len <= src.len() {
-                if let Some(body) = self.body_codec.decode(&mut src.split_to(len))? {
-                    return Ok(Some(Frame { header, body }))
+            match crate::u32_as_usize(header.len().val()) {
+                0 => return Ok(Some(Frame::new(header))),
+                n if n <= src.len() =>
+                    if let Some(body) = self.body_codec.decode(&mut src.split_to(n))? {
+                        return Ok(Some(Frame { header, body }))
+                    }
+                n => {
+                    let add = n - src.len();
+                    src.reserve(add)
                 }
-            } else {
-                let add = len - src.len();
-                src.reserve(add)
             }
             self.header = Some(header)
         }
@@ -176,8 +178,7 @@ pub enum FrameDecodeError {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use quickcheck::{Arbitrary, Gen, quickcheck};
-    use rand::Rng;
+    use quickcheck::{Arbitrary, Gen, QuickCheck};
     use super::*;
 
     impl Arbitrary for Frame<()> {
@@ -185,7 +186,7 @@ mod tests {
             let mut header: header::Header<()> = Arbitrary::arbitrary(g);
             let body =
                 if header.tag() == header::Tag::Data {
-                    header.set_len(header.len().val() % g.gen_range(0, 8192));
+                    header.set_len(header.len().val() % 4096);
                     BytesMut::from(vec![0; crate::u32_as_usize(header.len().val())])
                 } else {
                     BytesMut::new()
@@ -208,7 +209,10 @@ mod tests {
                 false
             }
         }
-        quickcheck(property as fn(Frame<()>) -> bool)
+
+        QuickCheck::new()
+            .tests(10_000)
+            .quickcheck(property as fn(Frame<()>) -> bool)
     }
 }
 

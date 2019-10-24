@@ -30,7 +30,7 @@ mod connection;
 mod error;
 mod frame;
 
-pub use crate::connection::{Connection, Mode, RemoteControl, Stream, into_stream};
+pub use crate::connection::{Connection, Mode, RemoteControl, State, Stream, into_stream};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{FrameDecodeError, header::{HeaderDecodeError, StreamId}};
 

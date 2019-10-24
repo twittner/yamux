@@ -8,6 +8,13 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+// TODO:
+//
+// - Change send to not also perform an implicit flush.
+// - Use an additional socket send buffer.
+// - Use different channel for remote control such that its
+//   messages can bypass the send commands of the streams.
+
 mod control;
 mod stream;
 
@@ -444,7 +451,7 @@ pub fn into_stream<T>(c: Connection<T>) -> impl futures::stream::Stream<Item = R
 where
     T: AsyncRead + AsyncWrite + Unpin
 {
-    futures::stream::unfold(c, |mut c| async move {
+    futures::stream::unfold(c, |mut c| async {
         match c.next_stream().await {
             Ok(None) => None,
             Ok(Some(stream)) => Some((Ok(stream), c)),

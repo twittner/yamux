@@ -24,7 +24,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::{io, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use super::Command;
 
-/// The state of a stream.
+/// The state of a Yamux stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {
     /// Open bidirectionally.
@@ -33,7 +33,7 @@ pub enum State {
     SendClosed,
     /// Open for outgoing messages.
     RecvClosed,
-    /// Closed.
+    /// Closed (terminal state).
     Closed
 }
 
@@ -88,6 +88,11 @@ impl Stream {
     /// Get this stream's identifier.
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    /// Get this stream's state.
+    pub fn state(&self) -> State {
+        self.shared().state()
     }
 
     pub(crate) fn strong_count(&self) -> usize {
