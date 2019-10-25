@@ -8,7 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-#![type_length_limit="3561018"]
+#![type_length_limit="1764723"]
 
 use async_std::{net::{TcpStream, TcpListener}, task};
 use bytes::Bytes;
@@ -17,28 +17,7 @@ use futures_codec::{BytesCodec, Framed};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use rand::Rng;
 use std::{fmt::Debug, io, net::{Ipv4Addr, SocketAddr, SocketAddrV4}};
-use yamux::{Config, Connection, ConnectionError, Mode, RemoteControl};
-
-async fn server_repeat_echo(listener: TcpListener, cfg: Config) -> Result<(), ConnectionError> {
-    let (socket, _) = listener.accept().await?;
-    let connection = Connection::new(socket, cfg, Mode::Server);
-    repeat_echo(connection, 1).await
-}
-
-async fn client_send_recv<I>
-    ( addr: SocketAddr
-    , cfg: Config
-    , iter: I
-    ) -> Result<Vec<Bytes>, ConnectionError>
-where
-    I: Iterator<Item = Bytes>
-{
-    let socket = TcpStream::connect(addr).await?;
-    let connection = Connection::new(socket, cfg, Mode::Client);
-    let control = connection.remote_control();
-    task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
-    send_recv(control, iter).await
-}
+use yamux::{Config, Connection, ConnectionError, Mode, RemoteControl, State};
 
 #[test]
 fn prop_send_recv() {
@@ -49,12 +28,24 @@ fn prop_send_recv() {
         task::block_on(async move {
             let num_requests = msgs.len();
             let iter = msgs.into_iter().map(Bytes::from);
-            let (listener, address) = bind().await.expect("prop_send_recv: bind");
-            let server = server_repeat_echo(listener, Config::default());
-            let client = client_send_recv(address, Config::default(), iter.clone());
-            let result = futures::try_join!(server, client)
-                .unwrap_or_else(|e| panic!("prop_send_recv error: {:?}", e))
-                .1;
+
+            let (listener, address) = bind().await.expect("bind");
+
+            let server = async {
+                let socket = listener.accept().await.expect("accept").0;
+                let connection = Connection::new(socket, Config::default(), Mode::Server);
+                repeat_echo(connection, 1).await.expect("repeat_echo")
+            };
+
+            let client = async {
+                let socket = TcpStream::connect(address).await.expect("connect");
+                let connection = Connection::new(socket, Config::default(), Mode::Client);
+                let control = connection.remote_control();
+                task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+                send_recv(control, iter.clone()).await.expect("send_recv")
+            };
+
+            let result = futures::join!(server, client).1;
             TestResult::from_bool(result.len() == num_requests && result.into_iter().eq(iter))
         })
     }
@@ -69,76 +60,84 @@ fn prop_max_streams() {
         cfg.set_max_num_streams(max_streams);
 
         task::block_on(async move {
-            let (listener, address) = bind().await.expect("prop_max_streams: bind");
-            task::spawn(server_repeat_echo(listener, cfg.clone()));
-            let socket = TcpStream::connect(address).await.expect("prop_max_streams: connect");
-            let connection = Connection::new(socket, cfg, Mode::Client);
-            let mut control = connection.remote_control();
-            task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
-            let mut v = Vec::new();
-            for _ in 0 .. max_streams {
-                v.push(control.open_stream().await.expect("prop_max_streams: open_stream"))
-            }
-            if let Err(ConnectionError::TooManyStreams) = control.open_stream().await {
-                true
-            } else {
-                false
-            }
+            let (listener, address) = bind().await.expect("bind");
+
+            let cfg_s = cfg.clone();
+            let server = async move {
+                let socket = listener.accept().await.expect("accept").0;
+                let connection = Connection::new(socket, cfg_s, Mode::Server);
+                repeat_echo(connection, 1).await
+            };
+
+            task::spawn(server);
+
+            let client = async {
+                let socket = TcpStream::connect(address).await.expect("connect");
+                let connection = Connection::new(socket, cfg, Mode::Client);
+                let mut control = connection.remote_control();
+                task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+                let mut v = Vec::new();
+                for _ in 0 .. max_streams {
+                    v.push(control.open_stream().await.expect("open_stream"))
+                }
+                if let Err(ConnectionError::TooManyStreams) = control.open_stream().await {
+                    true
+                } else {
+                    false
+                }
+            };
+
+            client.await
         })
     }
 
     QuickCheck::new().tests(7).quickcheck(prop as fn(_) -> _)
 }
 
-//#[test]
-//fn prop_send_recv_half_closed() {
-//    fn prop(msg: Msg) -> bool {
-//        let (l, a) = bind();
-//        let cfg = Config::default();
-//        let msg_len = msg.0.len();
-//
-//        // Server should be able to write on a stream shutdown by the client.
-//        let server = server(cfg.clone(), l).and_then(|c| {
-//            c.into_future().map_err(|(e,_)| e)
-//                .and_then(|(stream, _)| {
-//                    let s = stream.expect("S: No incoming stream");
-//                    let buf = vec![0; msg_len];
-//                    tokio::io::read_exact(s, buf)
-//                        .and_then(|(s, buf)| {
-//                            assert!(s.state() == Some(State::RecvClosed));
-//                            tokio::io::write_all(s, buf)
-//                        })
-//                        .and_then(|(s, _buf)| {
-//                            tokio::io::flush(s).map(|_| true)
-//                        }).from_err()
-//                })
-//                .map_err(|e| error!("S: connection error: {}", e))
-//        });
-//
-//        // Client should be able to read after shutting down the stream.
-//        let client = client(cfg, a).and_then(move |c| {
-//            let s = new_stream(&c);
-//            tokio::io::write_all(s, msg.clone())
-//                .and_then(|(s, _buf)| {
-//                    tokio::io::shutdown(s)
-//                })
-//                .and_then(move |s| {
-//                    assert!(s.state() == Some(State::SendClosed));
-//                    let buf = vec![0; msg_len];
-//                    tokio::io::read_exact(s, buf)
-//                })
-//                .and_then(move |(s, buf)| {
-//                    assert!(s.state() == Some(State::Closed));
-//                    future::ok(buf == msg.0)
-//                })
-//                .map_err(|e| error!("C: connection error: {}", e))
-//        });
-//
-//        client.join(server).wait() == Ok((true, true))
-//    }
-//
-//    QuickCheck::new().tests(3).quickcheck(prop as fn(_) -> _);
-//}
+#[test]
+fn prop_send_recv_half_closed() {
+    fn prop(msg: Msg) -> bool {
+        let msg_len = msg.0.len();
+        task::block_on(async move {
+            let (listener, address) = bind().await.expect("bind");
+
+            // Server should be able to write on a stream shutdown by the client.
+            let server = async {
+                let socket = listener.accept().await.expect("accept").0;
+                let mut connection = Connection::new(socket, Config::default(), Mode::Server);
+                let mut stream = connection.next_stream().await
+                    .expect("S: next_stream")
+                    .expect("S: some stream");
+                task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+                let mut buf = vec![0; msg_len];
+                stream.read_exact(&mut buf).await.expect("S: read_exact");
+                stream.write_all(&buf).await.expect("S: send");
+                stream.close().await.expect("S: close")
+            };
+
+            // Client should be able to read after shutting down the stream.
+            let client = async {
+                let socket = TcpStream::connect(address).await.expect("connect");
+                let connection = Connection::new(socket, Config::default(), Mode::Client);
+                let mut control = connection.remote_control();
+                task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+                let mut stream = control.open_stream().await.expect("C: open_stream");
+                stream.write_all(&msg.0).await.expect("C: send");
+                stream.close().await.expect("C: close");
+                assert_eq!(State::SendClosed, stream.state());
+                let mut buf = vec![0; msg_len];
+                stream.read_exact(&mut buf).await.expect("C: read_exact");
+                buf == msg.0
+            };
+
+            futures::join!(server, client).1
+        })
+    }
+
+    QuickCheck::new()
+        .tests(7)
+        .quickcheck(prop as fn(_) -> _);
+}
 
 #[derive(Clone, Debug)]
 struct Msg(Vec<u8>);
