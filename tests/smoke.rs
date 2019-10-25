@@ -90,13 +90,12 @@ fn prop_max_streams() {
             client.await
         })
     }
-
     QuickCheck::new().tests(7).quickcheck(prop as fn(_) -> _)
 }
 
 #[test]
 fn prop_send_recv_half_closed() {
-    fn prop(msg: Msg) -> bool {
+    fn prop(msg: Msg) {
         let msg_len = msg.0.len();
         task::block_on(async move {
             let (listener, address) = bind().await.expect("bind");
@@ -127,16 +126,15 @@ fn prop_send_recv_half_closed() {
                 assert_eq!(State::SendClosed, stream.state());
                 let mut buf = vec![0; msg_len];
                 stream.read_exact(&mut buf).await.expect("C: read_exact");
-                buf == msg.0
+                assert_eq!(buf, msg.0);
+                assert_eq!(Some(0), stream.read(&mut buf).await.ok());
+                assert_eq!(State::Closed, stream.state());
             };
 
-            futures::join!(server, client).1
+            futures::join!(server, client);
         })
     }
-
-    QuickCheck::new()
-        .tests(7)
-        .quickcheck(prop as fn(_) -> _);
+    QuickCheck::new().tests(7).quickcheck(prop as fn(_))
 }
 
 #[derive(Clone, Debug)]
