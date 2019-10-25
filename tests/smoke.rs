@@ -8,6 +8,8 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+#![type_length_limit="3561018"]
+
 use async_std::{net::{TcpStream, TcpListener}, task};
 use bytes::Bytes;
 use futures::{future, prelude::*};
@@ -20,44 +22,50 @@ use yamux::{Config, Connection, ConnectionError, Mode, RemoteControl};
 #[test]
 fn prop_send_recv() {
     let _ = env_logger::try_init();
-    fn prop(msgs: Vec<Msg>) -> TestResult {
+
+    async fn property(msgs: Vec<Msg>) -> Result<TestResult, ConnectionError> {
+        let num_requests = msgs.len();
+        let iter = msgs.into_iter().map(Bytes::from);
+        let (listener, address) = bind().await?;
+        let server = server(listener);
+        let client = client(address, iter.clone());
+        let r = futures::try_join!(server, client)?.1;
+        Ok(TestResult::from_bool(r.len() == num_requests && r.into_iter().eq(iter)))
+    }
+
+    async fn server(listener: TcpListener) -> Result<(), ConnectionError> {
+        let (socket, _) = listener.accept().await?;
+        let connection = Connection::new(socket, Config::default(), Mode::Server);
+        repeat_echo(connection, 1).await
+    }
+
+    async fn client<I>(address: SocketAddr, iter: I) -> Result<Vec<Bytes>, ConnectionError>
+    where
+        I: Iterator<Item = Bytes>
+    {
+        let socket = TcpStream::connect(address).await?;
+        let connection = Connection::new(socket, Config::default(), Mode::Client);
+        let control = connection.remote_control();
+        task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+        send_recv(control, iter).await
+    }
+
+    fn await_property_result(msgs: Vec<Msg>) -> TestResult {
         if msgs.is_empty() {
             return TestResult::discard()
         }
-        let result: Result<TestResult, ConnectionError> = task::block_on(async move {
-            let (listener, address) = bind().await?;
-            task::spawn(async move {
-                if let Ok((socket, _)) = listener.accept().await {
-                    let connection = Connection::new(socket, Config::default(), Mode::Server);
-                    if let Err(e) = repeat_echo(connection, 1).await {
-                        log::error!("S: repeat_echo error: {}", e)
-                    }
-                } else {
-                    log::error!("S: failed to accept connection");
+        task::block_on(async move {
+            match property(msgs).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("prop_send_recv error: {:?}", e);
+                    TestResult::error(e.to_string())
                 }
-            });
-
-            let num_requests = msgs.len();
-            let iter = msgs.into_iter().map(Bytes::from);
-
-            let socket = TcpStream::connect(address).await?;
-            let connection = Connection::new(socket, Config::default(), Mode::Client);
-            let control = connection.remote_control();
-            task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
-            let r = send_recv(control, iter.clone()).await?;
-            Ok(TestResult::from_bool(r.len() == num_requests && r.into_iter().eq(iter)))
-        });
-
-        match result {
-            Ok(r) => r,
-            Err(e) => TestResult::error(e.to_string())
-        }
+            }
+        })
     }
 
-    // A single run with up to QUICKCHECK_GENERATOR_SIZE messages
-    QuickCheck::new()
-        .tests(1)
-        .quickcheck(prop as fn(_) -> _);
+    QuickCheck::new().tests(1).quickcheck(await_property_result as fn(_) -> _)
 }
 
 //#[test]
