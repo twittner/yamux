@@ -22,6 +22,16 @@ pub struct Header<T> {
     _marker: std::marker::PhantomData<T>
 }
 
+impl<T> fmt::Display for Header<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "(Header {:?} {} (len {}) (flags {:?}))",
+            self.tag,
+            self.stream_id,
+            self.length.val(),
+            self.flags.val())
+    }
+}
+
 impl<T> Header<T> {
     pub fn tag(&self) -> Tag {
         self.tag
@@ -276,6 +286,10 @@ pub struct Flags(u16);
 impl Flags {
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    pub fn val(self) -> u16 {
+        self.0
     }
 }
 

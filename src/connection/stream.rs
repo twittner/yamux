@@ -13,6 +13,7 @@ use crate::{
     Config,
     WindowUpdateMode,
     chunks::Chunks,
+    connection::{self, Command},
     frame::{
         Frame,
         header::{StreamId, WindowUpdate}
@@ -22,7 +23,6 @@ use either::Either;
 use futures::{ready, channel::mpsc, io::{AsyncRead, AsyncWrite}};
 use parking_lot::{Mutex, MutexGuard};
 use std::{fmt, io, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
-use super::Command;
 
 /// The state of a Yamux stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,6 +60,7 @@ impl State {
 /// A multiplexed Yamux stream.
 pub struct Stream {
     id: StreamId,
+    conn: connection::Id,
     config: Arc<Config>,
     sender: mpsc::Sender<Command>,
     pending: Option<Frame<WindowUpdate>>,
@@ -70,14 +71,26 @@ impl fmt::Debug for Stream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Stream")
             .field("id", &self.id.val())
+            .field("connection", &self.conn)
             .field("pending", &self.pending.is_some())
             .finish()
+    }
+}
+
+impl fmt::Display for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(frame) = &self.pending {
+            write!(f, "(Stream {}/{} (pending {}))", self.conn, self.id.val(), frame.header())
+        } else {
+            write!(f, "(Stream {}/{})", self.conn, self.id.val())
+        }
     }
 }
 
 impl Stream {
     pub(crate) fn new
         ( id: StreamId
+        , conn: connection::Id
         , config: Arc<Config>
         , window: u32
         , credit: u32
@@ -86,6 +99,7 @@ impl Stream {
     {
         Stream {
             id,
+            conn,
             config,
             sender,
             pending: None,
@@ -114,6 +128,7 @@ impl Stream {
     pub(crate) fn clone(&self) -> Self {
         Stream {
             id: self.id,
+            conn: self.conn,
             config: self.config.clone(),
             sender: self.sender.clone(),
             pending: None,
@@ -123,12 +138,12 @@ impl Stream {
 
     fn send(mut self: Pin<&mut Self>, cx: &mut Context, cmd: Command) -> Poll<io::Result<()>> {
         if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-            log::debug!("{}: channel error: {}", self.id, e);
+            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
             let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
             return Poll::Ready(Err(e))
         }
         if let Err(e) = self.sender.start_send(cmd) {
-            log::debug!("{}: channel error: {}", self.id, e);
+            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
             let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
             return Poll::Ready(Err(e))
         }
@@ -145,13 +160,13 @@ impl AsyncRead for Stream {
         // Try to deliver any pending window updates first.
         if self.pending.is_some() {
             if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-                log::debug!("{}: channel error: {}", self.id, e);
+                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
                 let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
                 return Poll::Ready(Err(e))
             }
             let cmd = Command::Send(self.pending.take().unwrap().cast());
             if let Err(e) = self.sender.start_send(cmd) {
-                log::debug!("{}: channel error: {}", self.id, e);
+                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
                 let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
                 return Poll::Ready(Err(e))
             }
@@ -183,7 +198,7 @@ impl AsyncRead for Stream {
 
             // Buffer is empty, let's check if we can expect to read more data.
             if !shared.state().can_read() {
-                log::debug!("{}: can no longer read", self.id);
+                log::debug!("{}/{}: eof", self.conn, self.id);
                 return Poll::Ready(Ok(0)) // stream has been reset
             }
 
@@ -205,12 +220,12 @@ impl AsyncRead for Stream {
         match self.sender.poll_ready(cx) {
             Poll::Ready(Ok(())) =>
                 if let Err(e) = self.sender.start_send(Command::Send(frame.cast())) {
-                    log::debug!("{}: channel error: {}", self.id, e);
+                    log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
                     let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
                     return Poll::Ready(Err(e))
                 }
             Poll::Ready(Err(e)) => {
-                log::debug!("{}: channel error: {}", self.id, e);
+                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
                 let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
                 return Poll::Ready(Err(e))
             }
@@ -224,7 +239,7 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-            log::debug!("{}: channel error: {}", self.id, e);
+            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
             let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
             return Poll::Ready(Err(e))
         }
@@ -232,7 +247,7 @@ impl AsyncWrite for Stream {
         let body = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
-                log::debug!("{}: can no longer write", self.id);
+                log::debug!("{}/{}: can no longer write", self.conn, self.id);
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed")))
             }
             if shared.credit == 0 {
@@ -248,7 +263,7 @@ impl AsyncWrite for Stream {
         let frame = Frame::data(self.id, body).expect("body <= u32::MAX");
 
         if let Err(e) = self.sender.start_send(Command::Send(frame.cast())) {
-            log::debug!("{}: channel error: {}", self.id, e);
+            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
             let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
             return Poll::Ready(Err(e))
         }
@@ -265,7 +280,7 @@ impl AsyncWrite for Stream {
         if let Err(e) = ready!(self.as_mut().send(cx, cmd)) {
             return Poll::Ready(Err(e))
         }
-        self.shared().update_state(State::SendClosed);
+        self.shared().update_state(self.conn, self.id, State::SendClosed);
         Poll::Ready(Ok(()))
     }
 }
@@ -294,7 +309,7 @@ impl Shared {
         self.state
     }
 
-    pub(crate) fn update_state(&mut self, next: State) {
+    pub(crate) fn update_state(&mut self, cid: connection::Id, sid: StreamId, next: State) {
         use self::State::*;
 
         let current = self.state;
@@ -311,6 +326,8 @@ impl Shared {
             (SendClosed, RecvClosed) => self.state = Closed,
             (SendClosed, SendClosed) => {}
         }
+
+        log::trace!("{}/{}: update state: ({:?} {:?} {:?})", cid, sid, current, next, self.state)
     }
 }
 
