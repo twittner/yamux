@@ -19,76 +19,76 @@ use rand::Rng;
 use std::{fmt::Debug, io, net::{Ipv4Addr, SocketAddr, SocketAddrV4}};
 use yamux::{Config, Connection, ConnectionError, Mode, RemoteControl};
 
+async fn server_repeat_echo(listener: TcpListener, cfg: Config) -> Result<(), ConnectionError> {
+    let (socket, _) = listener.accept().await?;
+    let connection = Connection::new(socket, cfg, Mode::Server);
+    repeat_echo(connection, 1).await
+}
+
+async fn client_send_recv<I>
+    ( addr: SocketAddr
+    , cfg: Config
+    , iter: I
+    ) -> Result<Vec<Bytes>, ConnectionError>
+where
+    I: Iterator<Item = Bytes>
+{
+    let socket = TcpStream::connect(addr).await?;
+    let connection = Connection::new(socket, cfg, Mode::Client);
+    let control = connection.remote_control();
+    task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+    send_recv(control, iter).await
+}
+
 #[test]
 fn prop_send_recv() {
-    let _ = env_logger::try_init();
-
-    async fn property(msgs: Vec<Msg>) -> Result<TestResult, ConnectionError> {
-        let num_requests = msgs.len();
-        let iter = msgs.into_iter().map(Bytes::from);
-        let (listener, address) = bind().await?;
-        let server = server(listener);
-        let client = client(address, iter.clone());
-        let r = futures::try_join!(server, client)?.1;
-        Ok(TestResult::from_bool(r.len() == num_requests && r.into_iter().eq(iter)))
-    }
-
-    async fn server(listener: TcpListener) -> Result<(), ConnectionError> {
-        let (socket, _) = listener.accept().await?;
-        let connection = Connection::new(socket, Config::default(), Mode::Server);
-        repeat_echo(connection, 1).await
-    }
-
-    async fn client<I>(address: SocketAddr, iter: I) -> Result<Vec<Bytes>, ConnectionError>
-    where
-        I: Iterator<Item = Bytes>
-    {
-        let socket = TcpStream::connect(address).await?;
-        let connection = Connection::new(socket, Config::default(), Mode::Client);
-        let control = connection.remote_control();
-        task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
-        send_recv(control, iter).await
-    }
-
-    fn await_property_result(msgs: Vec<Msg>) -> TestResult {
+    fn prop(msgs: Vec<Msg>) -> TestResult {
         if msgs.is_empty() {
             return TestResult::discard()
         }
         task::block_on(async move {
-            match property(msgs).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("prop_send_recv error: {:?}", e);
-                    TestResult::error(e.to_string())
-                }
+            let num_requests = msgs.len();
+            let iter = msgs.into_iter().map(Bytes::from);
+            let (listener, address) = bind().await.expect("prop_send_recv: bind");
+            let server = server_repeat_echo(listener, Config::default());
+            let client = client_send_recv(address, Config::default(), iter.clone());
+            let result = futures::try_join!(server, client)
+                .unwrap_or_else(|e| panic!("prop_send_recv error: {:?}", e))
+                .1;
+            TestResult::from_bool(result.len() == num_requests && result.into_iter().eq(iter))
+        })
+    }
+    QuickCheck::new().tests(1).quickcheck(prop as fn(_) -> _)
+}
+
+#[test]
+fn prop_max_streams() {
+    fn prop(n: usize) -> bool {
+        let max_streams = n % 100;
+        let mut cfg = Config::default();
+        cfg.set_max_num_streams(max_streams);
+
+        task::block_on(async move {
+            let (listener, address) = bind().await.expect("prop_max_streams: bind");
+            task::spawn(server_repeat_echo(listener, cfg.clone()));
+            let socket = TcpStream::connect(address).await.expect("prop_max_streams: connect");
+            let connection = Connection::new(socket, cfg, Mode::Client);
+            let mut control = connection.remote_control();
+            task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+            let mut v = Vec::new();
+            for _ in 0 .. max_streams {
+                v.push(control.open_stream().await.expect("prop_max_streams: open_stream"))
+            }
+            if let Err(ConnectionError::TooManyStreams) = control.open_stream().await {
+                true
+            } else {
+                false
             }
         })
     }
 
-    QuickCheck::new().tests(1).quickcheck(await_property_result as fn(_) -> _)
+    QuickCheck::new().tests(7).quickcheck(prop as fn(_) -> _)
 }
-
-//#[test]
-//fn prop_max_streams() {
-//    fn prop(n: usize) -> bool {
-//        let (l, a) = bind();
-//        let mut cfg = Config::default();
-//        let max_streams = n % 100;
-//        cfg.set_max_num_streams(max_streams);
-//        let codec = BytesCodec::new();
-//        let server = server(cfg.clone(), l).and_then(move |c| repeat_echo(c, codec, 1));
-//        let client = client(cfg, a).and_then(move |conn| {
-//            let mut v = Vec::new();
-//            for _ in 0 .. max_streams {
-//                v.push(new_stream(&conn))
-//            }
-//            Ok(conn.open_stream().is_err())
-//        });
-//        run(server, client)
-//    }
-//
-//    quickcheck(prop as fn(_) -> _);
-//}
 
 //#[test]
 //fn prop_send_recv_half_closed() {
