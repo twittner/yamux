@@ -31,6 +31,15 @@ pub struct RemoteControl {
     state: RemoteControlState
 }
 
+impl Clone for RemoteControl {
+    fn clone(&self) -> Self {
+        RemoteControl {
+            sender: self.sender.clone(),
+            state: RemoteControlState::Idle
+        }
+    }
+}
+
 /// Internal state used for the implementation of the `poll_*` methods.
 #[derive(Debug)]
 enum RemoteControlState {

@@ -71,23 +71,19 @@ fn prop_max_streams() {
 
             task::spawn(server);
 
-            let client = async {
-                let socket = TcpStream::connect(address).await.expect("connect");
-                let connection = Connection::new(socket, cfg, Mode::Client);
-                let mut control = connection.remote_control();
-                task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
-                let mut v = Vec::new();
-                for _ in 0 .. max_streams {
-                    v.push(control.open_stream().await.expect("open_stream"))
-                }
-                if let Err(ConnectionError::TooManyStreams) = control.open_stream().await {
-                    true
-                } else {
-                    false
-                }
-            };
-
-            client.await
+            let socket = TcpStream::connect(address).await.expect("connect");
+            let connection = Connection::new(socket, cfg, Mode::Client);
+            let mut control = connection.remote_control();
+            task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
+            let mut v = Vec::new();
+            for _ in 0 .. max_streams {
+                v.push(control.open_stream().await.expect("open_stream"))
+            }
+            if let Err(ConnectionError::TooManyStreams) = control.open_stream().await {
+                true
+            } else {
+                false
+            }
         })
     }
     QuickCheck::new().tests(7).quickcheck(prop as fn(_) -> _)
@@ -172,7 +168,6 @@ async fn bind() -> io::Result<(TcpListener, SocketAddr)> {
 /// For each incoming stream of `c` echo back `n` frames to the sender.
 async fn repeat_echo(c: Connection<TcpStream>, n: u64) -> Result<(), ConnectionError> {
     let c = yamux::into_stream(c);
-    futures::pin_mut!(c);
     c.try_for_each_concurrent(None, |stream| async {
         let (os, is) = Framed::new(stream, BytesCodec {}).split();
         is.take(n).forward(os).await?;
