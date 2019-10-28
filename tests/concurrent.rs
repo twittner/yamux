@@ -61,8 +61,6 @@ async fn roundtrip(address: SocketAddr, nstreams: u64, data: Bytes) {
 
 #[test]
 fn concurrent_streams() {
-    let _ = env_logger::try_init();
-
     let data = std::iter::repeat(0x42u8)
         .take(100 * 1024)
         .collect::<Vec<_>>()

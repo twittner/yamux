@@ -25,7 +25,6 @@
 #![recursion_limit = "1024"]
 
 mod chunks;
-mod compat;
 mod connection;
 mod error;
 mod frame;

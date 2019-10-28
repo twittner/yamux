@@ -8,7 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use std::collections::VecDeque;
 
 /// A sequence of [`BytesMut`] values.
@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 /// [`BytesMut`] elements.
 #[derive(Debug)]
 pub struct Chunks {
-    seq: VecDeque<BytesMut>
+    seq: VecDeque<Bytes>
 }
 
 impl Chunks {
@@ -32,15 +32,15 @@ impl Chunks {
         })
     }
 
-    pub fn push(&mut self, x: BytesMut) {
+    pub fn push(&mut self, x: Bytes) {
         self.seq.push_back(x)
     }
 
-    pub fn pop(&mut self) -> Option<BytesMut> {
+    pub fn pop(&mut self) -> Option<Bytes> {
         self.seq.pop_front()
     }
 
-    pub fn front_mut(&mut self) -> Option<&mut BytesMut> {
+    pub fn front_mut(&mut self) -> Option<&mut Bytes> {
         self.seq.front_mut()
     }
 }

@@ -10,22 +10,22 @@
 
 pub mod header;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use futures_codec::{BytesCodec, Decoder, Encoder};
 use header::{Header, HeaderDecodeError, StreamId, Data, WindowUpdate, GoAway};
-use std::{convert::TryInto, io, num::TryFromIntError};
+use std::{convert::TryInto, fmt, io, num::TryFromIntError};
 use thiserror::Error;
-use tokio_codec::{BytesCodec, Decoder, Encoder};
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame<T> {
     header: Header<T>,
-    body: BytesMut
+    body: Bytes
 }
 
 impl<T> Frame<T> {
     pub fn new(header: Header<T>) -> Self {
-        Frame { header, body: BytesMut::new() }
+        Frame { header, body: Bytes::new() }
     }
 
     pub fn header(&self) -> &Header<T> {
@@ -45,18 +45,18 @@ impl<T> Frame<T> {
 }
 
 impl Frame<Data> {
-    pub fn data(id: StreamId, b: BytesMut) -> Result<Self, TryFromIntError> {
+    pub fn data(id: StreamId, b: Bytes) -> Result<Self, TryFromIntError> {
         Ok(Frame {
             header: Header::data(id, b.len().try_into()?),
             body: b
         })
     }
 
-    pub fn body(&self) -> &BytesMut {
+    pub fn body(&self) -> &Bytes {
         &self.body
     }
 
-    pub fn into_body(self) -> BytesMut {
+    pub fn into_body(self) -> Bytes {
         self.body
     }
 }
@@ -65,7 +65,7 @@ impl Frame<WindowUpdate> {
     pub fn window_update(id: StreamId, credit: u32) -> Self {
         Frame {
             header: Header::window_update(id, credit),
-            body: BytesMut::new()
+            body: Bytes::new()
         }
     }
 }
@@ -74,31 +74,38 @@ impl Frame<GoAway> {
     pub fn term() -> Self {
         Frame {
             header: Header::term(),
-            body: BytesMut::new()
+            body: Bytes::new()
         }
     }
 
     pub fn protocol_error() -> Self {
         Frame {
             header: Header::protocol_error(),
-            body: BytesMut::new()
+            body: Bytes::new()
         }
     }
 
     pub fn internal_error() -> Self {
         Frame {
             header: Header::internal_error(),
-            body: BytesMut::new()
+            body: Bytes::new()
         }
     }
 }
 
 /// A decoder and encoder or message frames.
-#[derive(Debug)]
 pub struct Codec {
     header_codec: header::Codec,
     body_codec: BytesCodec,
     header: Option<header::Header<()>>
+}
+
+impl fmt::Debug for Codec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Codec")
+            .field("header", &self.header)
+            .finish()
+    }
 }
 
 impl Codec {
@@ -106,7 +113,7 @@ impl Codec {
     pub fn new(max_body_len: usize) -> Codec {
         Codec {
             header_codec: header::Codec::new(max_body_len),
-            body_codec: BytesCodec::new(),
+            body_codec: BytesCodec {},
             header: None
         }
     }
@@ -119,7 +126,7 @@ impl Encoder for Codec {
     fn encode(&mut self, frame: Self::Item, bytes: &mut BytesMut) -> Result<(), Self::Error> {
         let header = self.header_codec.encode(&frame.header);
         bytes.extend_from_slice(&header);
-        Ok(self.body_codec.encode(frame.body.freeze(), bytes)?)
+        Ok(self.body_codec.encode(frame.body, bytes)?)
     }
 }
 
@@ -187,9 +194,9 @@ mod tests {
             let body =
                 if header.tag() == header::Tag::Data {
                     header.set_len(header.len().val() % 4096);
-                    BytesMut::from(vec![0; crate::u32_as_usize(header.len().val())])
+                    Bytes::from(vec![0; crate::u32_as_usize(header.len().val())])
                 } else {
-                    BytesMut::new()
+                    Bytes::new()
                 };
             Frame { header, body }
         }

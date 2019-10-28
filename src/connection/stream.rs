@@ -8,7 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use crate::{
     Config,
     WindowUpdateMode,
@@ -204,7 +204,7 @@ impl AsyncRead for Stream {
 
             // Since we have no more data at this point, we want to be woken up
             // by the connection when more becomes available for us.
-            shared.waker = Some(cx.waker().clone());
+            shared.reader = Some(cx.waker().clone());
 
             // Finally, let's see if we need to send a window update to the remote.
             if self.config.window_update_mode != WindowUpdateMode::OnRead || shared.window > 0 {
@@ -251,12 +251,12 @@ impl AsyncWrite for Stream {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed")))
             }
             if shared.credit == 0 {
-                shared.waker = Some(cx.waker().clone());
+                shared.writer = Some(cx.waker().clone());
                 return Poll::Pending
             }
             let k = std::cmp::min(crate::u32_as_usize(shared.credit), buf.len());
             shared.credit = shared.credit.saturating_sub(k as u32);
-            BytesMut::from(&buf[.. k])
+            Bytes::from(&buf[.. k])
         };
 
         let n = body.len();
@@ -291,7 +291,8 @@ pub(crate) struct Shared {
     pub(crate) window: u32,
     pub(crate) credit: u32,
     pub(crate) buffer: Chunks,
-    pub(crate) waker: Option<Waker>
+    pub(crate) reader: Option<Waker>,
+    pub(crate) writer: Option<Waker>
 }
 
 impl Shared {
@@ -301,7 +302,8 @@ impl Shared {
             window,
             credit,
             buffer: Chunks::new(),
-            waker: None
+            reader: None,
+            writer: None
         }
     }
 

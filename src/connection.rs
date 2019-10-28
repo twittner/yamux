@@ -22,16 +22,15 @@ use crate::{
     Config,
     DEFAULT_CREDIT,
     WindowUpdateMode,
-    compat,
     error::ConnectionError,
     frame::{self, Frame},
     frame::header::{self, CONNECTION_ID, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate}
 };
 use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
+use futures_codec::Framed;
 use nohash_hasher::IntMap;
 use std::{fmt, sync::Arc};
-use tokio_codec::Framed;
 
 pub use control::RemoteControl;
 pub use stream::{State, Stream};
@@ -74,7 +73,7 @@ pub struct Connection<T> {
     id: Id,
     mode: Mode,
     config: Arc<Config>,
-    socket: Fuse<Framed<compat::AioCompat<T>, frame::Codec>>,
+    socket: Fuse<Framed<T, frame::Codec>>,
     next_id: u32,
     streams: IntMap<u32, Stream>,
     sender: mpsc::Sender<Command>,
@@ -134,7 +133,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         let id = Id(rand::random());
         log::debug!("new connection: {} ({:?})", id, mode);
         let (sender, receiver) = mpsc::channel(cfg.max_pending_frames);
-        let socket = compat::AioCompat(socket);
         let socket = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).fuse();
         Connection {
             id,
@@ -178,7 +176,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         for (id, s) in self.streams.drain() {
             let mut shared = s.shared();
             shared.update_state(self.id, StreamId::new(id), State::Closed);
-            if let Some(w) = shared.waker.take() {
+            if let Some(w) = shared.reader.take() {
+                w.wake()
+            }
+            if let Some(w) = shared.writer.take() {
                 w.wake()
             }
         }
@@ -197,9 +198,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             // If we ever get async. destructors we can replace this with
             // streams sending a proper command on drop.
             let conn_id = self.id;
-            self.streams.retain(|_, stream| {
+            self.streams.retain(|&id, stream| {
                 if stream.strong_count() == 1 {
                     log::trace!("{}: removing dropped {}", conn_id, stream);
+                    let mut shared = stream.shared();
+                    shared.update_state(conn_id, StreamId::new(id), State::Closed);
+                    if let Some(w) = shared.reader.take() {
+                        w.wake()
+                    }
+                    if let Some(w) = shared.writer.take() {
+                        w.wake()
+                    }
                     return false
                 }
                 true
@@ -391,7 +400,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
             shared.window = shared.window.saturating_sub(frame.body().len() as u32);
             shared.buffer.push(frame.into_body());
-            if let Some(w) = shared.waker.take() {
+            if let Some(w) = shared.reader.take() {
                 w.wake()
             }
             if !is_finish
@@ -451,7 +460,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             if is_finish {
                 shared.update_state(self.id, stream_id, State::RecvClosed)
             }
-            if let Some(w) = shared.waker.take() {
+            if let Some(w) = shared.writer.take() {
                 w.wake()
             }
         }
