@@ -12,7 +12,7 @@ edition = "2018"
 bytes = "0.4.12"
 either = "1.5.3"
 futures-preview = { version = "0.3.0-alpha.19", features = ["async-await"] }
-futures_codec = { git = "https://github.com/twittner/futures-codec.git", branch = "fix_poll_close" }
+futures_codec = "0.3.0"
 log = "0.4.8"
 nohash-hasher = "0.1.2"
 parking_lot = "0.9"

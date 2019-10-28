@@ -64,6 +64,7 @@ pub struct Stream {
     config: Arc<Config>,
     sender: mpsc::Sender<Command>,
     pending: Option<Frame<WindowUpdate>>,
+    is_closing: bool,
     shared: Arc<Mutex<Shared>>
 }
 
@@ -73,17 +74,14 @@ impl fmt::Debug for Stream {
             .field("id", &self.id.val())
             .field("connection", &self.conn)
             .field("pending", &self.pending.is_some())
+            .field("is_closing", &self.is_closing)
             .finish()
     }
 }
 
 impl fmt::Display for Stream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(frame) = &self.pending {
-            write!(f, "(Stream {}/{} (pending {}))", self.conn, self.id.val(), frame.header())
-        } else {
-            write!(f, "(Stream {}/{})", self.conn, self.id.val())
-        }
+        write!(f, "(Stream {}/{})", self.conn, self.id.val())
     }
 }
 
@@ -103,6 +101,7 @@ impl Stream {
             config,
             sender,
             pending: None,
+            is_closing: false,
             shared: Arc::new(Mutex::new(Shared::new(window, credit))),
         }
     }
@@ -132,6 +131,7 @@ impl Stream {
             config: self.config.clone(),
             sender: self.sender.clone(),
             pending: None,
+            is_closing: false,
             shared: self.shared.clone()
         }
     }
@@ -272,10 +272,14 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        if self.is_closing {
+            return Poll::Ready(Ok(()))
+        }
         self.send(cx, Command::Flush)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.is_closing = true;
         let cmd = Command::Close(Either::Left(self.id));
         if let Err(e) = ready!(self.as_mut().send(cx, cmd)) {
             return Poll::Ready(Err(e))
