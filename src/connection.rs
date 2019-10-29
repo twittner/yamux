@@ -285,21 +285,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                                 log::trace!("{}/{}: sending window update",
                                     self.id,
                                     frame.header().stream_id());
-
                                 self.socket.send(frame.cast()).await?
                             }
                             Action::Ping(frame) => {
                                 log::trace!("{}/{}: sending ping answer",
                                     self.id,
                                     frame.header().stream_id());
-
                                 self.socket.send(frame.cast()).await?
                             }
                             Action::Reset(frame) => {
                                 log::trace!("{}/{}: sending reset",
                                     self.id,
                                     frame.header().stream_id());
-
                                 self.socket.send(frame.cast()).await?
                             }
                             Action::Terminate(frame) => {
@@ -409,6 +406,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 let frame = Frame::window_update(stream_id, self.config.receive_window);
                 return Action::Update(frame)
             }
+        } else if !is_finish {
+            log::warn!("{}/{}: data for unknown stream", self.id, stream_id);
+            let mut header = Header::data(stream_id, 0);
+            header.rst();
+            return Action::Reset(Frame::new(header))
         }
 
         Action::None
@@ -461,6 +463,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             if let Some(w) = shared.writer.take() {
                 w.wake()
             }
+        } else if !is_finish {
+            log::debug!("{}/{}: window update for unknown stream", self.id, stream_id);
+            let mut header = Header::data(stream_id, 0);
+            header.rst();
+            return Action::Reset(Frame::new(header))
         }
 
         Action::None
@@ -476,8 +483,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             hdr.ack();
             return Action::Ping(Frame::new(hdr))
         }
-        log::debug!("{}/{}: received ping for unknown stream", self.id, stream_id);
-        Action::None
+        log::debug!("{}/{}: ping for unknown stream", self.id, stream_id);
+        let mut header = Header::data(stream_id, 0);
+        header.rst();
+        Action::Reset(Frame::new(header))
     }
 
     // Get the next valid stream ID.

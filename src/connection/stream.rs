@@ -193,6 +193,7 @@ impl AsyncRead for Stream {
             }
 
             if n > 0 {
+                log::trace!("{}/{}: read {} bytes", self.conn, self.id, n);
                 return Poll::Ready(Ok(n))
             }
 
@@ -262,6 +263,7 @@ impl AsyncWrite for Stream {
         let n = body.len();
         let frame = Frame::data(self.id, body).expect("body <= u32::MAX");
 
+        log::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
         if let Err(e) = self.sender.start_send(Command::Send(frame.cast())) {
             log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
             let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
@@ -272,14 +274,19 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        if self.is_closing {
+        if self.is_closing || self.state() == State::Closed {
             return Poll::Ready(Ok(()))
         }
+        log::trace!("{}/{}: flush", self.conn, self.id);
         self.send(cx, Command::Flush)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         self.is_closing = true;
+        if self.state() == State::Closed {
+            return Poll::Ready(Ok(()))
+        }
+        log::trace!("{}/{}: close", self.conn, self.id);
         let cmd = Command::Close(Either::Left(self.id));
         if let Err(e) = ready!(self.as_mut().send(cx, cmd)) {
             return Poll::Ready(Err(e))
