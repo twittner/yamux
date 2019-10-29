@@ -19,7 +19,6 @@ use crate::{
     frame::{self, Frame},
     frame::header::{self, CONNECTION_ID, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate}
 };
-use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
 use futures_codec::Framed;
 use nohash_hasher::IntMap;
@@ -74,16 +73,18 @@ pub struct Connection<T> {
 }
 
 /// Connection commands.
+///
+/// These are sent from `Stream`s and `RemoteControl`s.
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Open a new stream to remote.
-    Open(oneshot::Sender<Result<Stream>>),
+    OpenStream(oneshot::Sender<Result<Stream>>),
     /// A new frame should be sent to remote.
-    Send(Frame<()>),
-    /// Flush the socket.
-    Flush,
-    /// Close the stream or the connection.
-    Close(Either<StreamId, oneshot::Sender<()>>)
+    SendFrame(Frame<()>),
+    /// Close a stream.
+    CloseStream(StreamId),
+    /// Close the whole connection.
+    CloseConnection(oneshot::Sender<()>)
 }
 
 /// Possible actions as a result of incoming frame handling.
@@ -218,8 +219,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             futures::select! {
                 // Handle commands from remote control or our own streams.
                 command = self.receiver.next() => match command {
-                    // Open a new stream.
-                    Some(Command::Open(reply)) => {
+                    Some(Command::OpenStream(reply)) => {
                         if self.streams.len() >= self.config.max_num_streams {
                             log::error!("{}: maximum number of streams reached", self.id);
                             let _ = reply.send(Err(ConnectionError::TooManyStreams));
@@ -240,25 +240,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         log::debug!("{}: new outbound {} of {}", self.id, stream, self);
                         let _ = reply.send(Ok(stream));
                     }
-                    // Send a frame from one of our own streams.
-                    Some(Command::Send(frame)) => {
+                    Some(Command::SendFrame(frame)) => {
                         log::trace!("{}: sending: {}", self.id, frame.header());
                         self.socket.send(frame).await?
                     }
-                    // Flush the connection.
-                    Some(Command::Flush) => {
-                        log::trace!("{}: flushing socket", self.id);
-                        self.socket.flush().await?
-                    }
-                    // Close a stream.
-                    Some(Command::Close(Either::Left(id))) => {
+                    Some(Command::CloseStream(id)) => {
                         log::trace!("{}: closing stream {} of {}", self.id, id, self);
                         let mut header = Header::data(id, 0);
                         header.fin();
                         self.socket.send(Frame::new(header).cast()).await?
                     }
-                    // Close the whole connection.
-                    Some(Command::Close(Either::Right(reply))) => {
+                    Some(Command::CloseConnection(reply)) => {
                         log::debug!("{}: closing connection", self.id);
                         self.socket.send(Frame::term().cast()).await?;
                         let _ = reply.send(());
@@ -308,7 +300,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                                 self.socket.send(frame.cast()).await?
                             }
                         }
-                        self.socket.flush().await?
                     }
                     Ok(None) => {
                         log::debug!("{}: socket eof", self.id);

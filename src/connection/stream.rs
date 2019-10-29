@@ -19,7 +19,6 @@ use crate::{
         header::{StreamId, WindowUpdate}
     }
 };
-use either::Either;
 use futures::{ready, channel::mpsc, io::{AsyncRead, AsyncWrite}};
 use parking_lot::{Mutex, MutexGuard};
 use std::{fmt, io, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
@@ -64,7 +63,6 @@ pub struct Stream {
     config: Arc<Config>,
     sender: mpsc::Sender<Command>,
     pending: Option<Frame<WindowUpdate>>,
-    is_closing: bool,
     shared: Arc<Mutex<Shared>>
 }
 
@@ -74,7 +72,6 @@ impl fmt::Debug for Stream {
             .field("id", &self.id.val())
             .field("connection", &self.conn)
             .field("pending", &self.pending.is_some())
-            .field("is_closing", &self.is_closing)
             .finish()
     }
 }
@@ -101,7 +98,6 @@ impl Stream {
             config,
             sender,
             pending: None,
-            is_closing: false,
             shared: Arc::new(Mutex::new(Shared::new(window, credit))),
         }
     }
@@ -131,23 +127,13 @@ impl Stream {
             config: self.config.clone(),
             sender: self.sender.clone(),
             pending: None,
-            is_closing: false,
             shared: self.shared.clone()
         }
     }
 
-    fn send(mut self: Pin<&mut Self>, cx: &mut Context, cmd: Command) -> Poll<io::Result<()>> {
-        if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-            let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-            return Poll::Ready(Err(e))
-        }
-        if let Err(e) = self.sender.start_send(cmd) {
-            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-            let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-            return Poll::Ready(Err(e))
-        }
-        Poll::Ready(Ok(()))
+    fn write_zero_err(&self) -> io::Error {
+        let msg = format!("{}/{}: connection is closed", self.conn, self.id);
+        io::Error::new(io::ErrorKind::WriteZero, msg)
     }
 }
 
@@ -159,17 +145,10 @@ impl AsyncRead for Stream {
 
         // Try to deliver any pending window updates first.
         if self.pending.is_some() {
-            if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-                let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-                return Poll::Ready(Err(e))
-            }
-            let cmd = Command::Send(self.pending.take().unwrap().cast());
-            if let Err(e) = self.sender.start_send(cmd) {
-                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-                let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-                return Poll::Ready(Err(e))
-            }
+            ready!(self.sender.poll_ready(cx).map_err(|_| self.write_zero_err())?);
+            let frm = self.pending.take().expect("pending.is_some()");
+            let cmd = Command::SendFrame(frm.cast());
+            self.sender.start_send(cmd).map_err(|_| self.write_zero_err())?
         }
 
         // We need to limit the `shared` `MutexGuard` scope, or else we run into
@@ -209,7 +188,7 @@ impl AsyncRead for Stream {
 
             // Finally, let's see if we need to send a window update to the remote.
             if self.config.window_update_mode != WindowUpdateMode::OnRead || shared.window > 0 {
-                // Nope, time to leave.
+                // No, time to go.
                 return Poll::Pending
             }
 
@@ -218,17 +197,10 @@ impl AsyncRead for Stream {
 
         // At this point we know we have to send a window update to the remote.
         let frame = Frame::window_update(self.id, self.config.receive_window);
-        match self.sender.poll_ready(cx) {
-            Poll::Ready(Ok(())) =>
-                if let Err(e) = self.sender.start_send(Command::Send(frame.cast())) {
-                    log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-                    let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-                    return Poll::Ready(Err(e))
-                }
-            Poll::Ready(Err(e)) => {
-                log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-                let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-                return Poll::Ready(Err(e))
+        match self.sender.poll_ready(cx).map_err(|_| self.write_zero_err())? {
+            Poll::Ready(()) => {
+                let cmd = Command::SendFrame(frame.cast());
+                self.sender.start_send(cmd).map_err(|_| self.write_zero_err())?
             }
             Poll::Pending => self.pending = Some(frame)
         }
@@ -239,17 +211,12 @@ impl AsyncRead for Stream {
 
 impl AsyncWrite for Stream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if let Err(e) = ready!(self.sender.poll_ready(cx)) {
-            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-            let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-            return Poll::Ready(Err(e))
-        }
-
+        ready!(self.sender.poll_ready(cx).map_err(|_| self.write_zero_err())?);
         let body = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
                 log::debug!("{}/{}: can no longer write", self.conn, self.id);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed")))
+                return Poll::Ready(Err(self.write_zero_err()))
             }
             if shared.credit == 0 {
                 log::trace!("{}/{}: no more credit left", self.conn, self.id);
@@ -260,38 +227,26 @@ impl AsyncWrite for Stream {
             shared.credit = shared.credit.saturating_sub(k as u32);
             Bytes::from(&buf[.. k])
         };
-
         let n = body.len();
         let frame = Frame::data(self.id, body).expect("body <= u32::MAX");
-
         log::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
-        if let Err(e) = self.sender.start_send(Command::Send(frame.cast())) {
-            log::debug!("{}/{}: channel error: {}", self.conn, self.id, e);
-            let e = io::Error::new(io::ErrorKind::WriteZero, "connection is closed");
-            return Poll::Ready(Err(e))
-        }
-
+        let cmd = Command::SendFrame(frame.cast());
+        self.sender.start_send(cmd).map_err(|_| self.write_zero_err())?;
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        if self.is_closing || self.state() == State::Closed {
-            return Poll::Ready(Ok(()))
-        }
-        log::trace!("{}/{}: flush", self.conn, self.id);
-        self.send(cx, Command::Flush)
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.is_closing = true;
         if self.state() == State::Closed {
             return Poll::Ready(Ok(()))
         }
         log::trace!("{}/{}: close", self.conn, self.id);
-        let cmd = Command::Close(Either::Left(self.id));
-        if let Err(e) = ready!(self.as_mut().send(cx, cmd)) {
-            return Poll::Ready(Err(e))
-        }
+        ready!(self.sender.poll_ready(cx).map_err(|_| self.write_zero_err())?);
+        let cmd = Command::CloseStream(self.id);
+        self.sender.start_send(cmd).map_err(|_| self.write_zero_err())?;
         self.shared().update_state(self.conn, self.id, State::SendClosed);
         Poll::Ready(Ok(()))
     }

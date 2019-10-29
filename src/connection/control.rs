@@ -9,7 +9,6 @@
 // at https://opensource.org/licenses/MIT.
 
 use crate::{Stream, error::ConnectionError};
-use either::Either;
 use futures::{ready, channel::{mpsc, oneshot}, prelude::*};
 use std::{pin::Pin, task::{Context, Poll}};
 use super::Command;
@@ -62,41 +61,35 @@ impl RemoteControl {
     /// Open a new stream to the remote.
     pub async fn open_stream(&mut self) -> Result<Stream> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(Command::Open(tx)).await?;
+        self.sender.send(Command::OpenStream(tx)).await?;
         rx.await?
     }
 
     /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(Command::Close(Either::Right(tx))).await?;
+        self.sender.send(Command::CloseConnection(tx)).await?;
         Ok(rx.await?)
     }
 
     /// [`Poll`] based alternative to [`RemoteControl::open_stream`].
     pub fn poll_open_stream(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Stream>> {
-        if ready!(self.sender.poll_ready(cx)).is_err() {
-            return Poll::Ready(Err(ConnectionError::Closed))
-        }
+        ready!(self.sender.poll_ready(cx)?);
         loop {
             match std::mem::replace(&mut self.state, RemoteControlState::Idle) {
                 RemoteControlState::Idle => {
                     let (tx, rx) = oneshot::channel();
-                    if self.sender.start_send(Command::Open(tx)).is_err() {
-                        return Poll::Ready(Err(ConnectionError::Closed))
-                    }
+                    self.sender.start_send(Command::OpenStream(tx))?;
                     self.state = RemoteControlState::AwaitOpen(rx)
                 }
-                RemoteControlState::AwaitOpen(mut rx) => {
-                    return match Pin::new(&mut rx).poll(cx) {
-                        Poll::Ready(Ok(result)) => Poll::Ready(result),
-                        Poll::Ready(Err(_)) => Poll::Ready(Err(ConnectionError::Closed)),
+                RemoteControlState::AwaitOpen(mut rx) =>
+                    match Pin::new(&mut rx).poll(cx)? {
+                        Poll::Ready(result) => return Poll::Ready(result),
                         Poll::Pending => {
                             self.state = RemoteControlState::AwaitOpen(rx);
-                            Poll::Pending
+                            return Poll::Pending
                         }
                     }
-                }
                 RemoteControlState::AwaitClose(_) => panic!("invalid remote control state")
             }
         }
@@ -104,27 +97,22 @@ impl RemoteControl {
 
     /// [`Poll`] based alternative to [`RemoteControl::close`].
     pub fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-        if ready!(self.sender.poll_ready(cx)).is_err() {
-            return Poll::Ready(Err(ConnectionError::Closed))
-        }
+        ready!(self.sender.poll_ready(cx)?);
         loop {
             match std::mem::replace(&mut self.state, RemoteControlState::Idle) {
                 RemoteControlState::Idle => {
                     let (tx, rx) = oneshot::channel();
-                    if self.sender.start_send(Command::Close(Either::Right(tx))).is_err() {
-                        return Poll::Ready(Err(ConnectionError::Closed))
-                    }
+                    self.sender.start_send(Command::CloseConnection(tx))?;
                     self.state = RemoteControlState::AwaitClose(rx)
                 }
-                RemoteControlState::AwaitClose(mut rx) => {
-                    return match Pin::new(&mut rx).poll(cx) {
-                        Poll::Ready(result) => Poll::Ready(result.map_err(ConnectionError::from)),
+                RemoteControlState::AwaitClose(mut rx) =>
+                    match Pin::new(&mut rx).poll(cx)? {
+                        Poll::Ready(()) => return Poll::Ready(Ok(())),
                         Poll::Pending => {
                             self.state = RemoteControlState::AwaitClose(rx);
-                            Poll::Pending
+                            return Poll::Pending
                         }
                     }
-                }
                 RemoteControlState::AwaitOpen(_) => panic!("invalid remote control state")
             }
         }
