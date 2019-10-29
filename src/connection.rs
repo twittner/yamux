@@ -177,8 +177,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         }
 
-        if let Err(ConnectionError::Io(_)) = result {
-            return result
+        if let Err(e) = &result {
+            if e.is_connection_closed() {
+                return Ok(None)
+            }
+            if e.is_io_error() {
+                return result
+            }
         }
 
         self.socket.close().await?;

@@ -39,6 +39,32 @@ pub enum ConnectionError {
     __Nonexhaustive
 }
 
+impl ConnectionError {
+    pub(crate) fn is_io_error(&self) -> bool {
+        if let ConnectionError::Io(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_connection_closed(&self) -> bool {
+        use std::io::ErrorKind;
+        match self {
+            ConnectionError::Io(e) => match e.kind() {
+                ErrorKind::ConnectionReset => true,
+                ErrorKind::ConnectionAborted => true,
+                ErrorKind::BrokenPipe => true,
+                ErrorKind::WriteZero => true,
+                ErrorKind::UnexpectedEof => true,
+                _ => false
+            }
+            ConnectionError::Closed => true,
+            _ => false
+        }
+    }
+}
+
 impl From<futures::channel::mpsc::SendError> for ConnectionError {
     fn from(_: futures::channel::mpsc::SendError) -> Self {
         ConnectionError::Closed
