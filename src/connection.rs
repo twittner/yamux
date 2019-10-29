@@ -12,8 +12,6 @@
 //
 // - Change send to not also perform an implicit flush.
 // - Use an additional socket send buffer.
-// - Use different channel for remote control such that its
-//   messages can bypass the send commands of the streams.
 
 mod control;
 mod stream;

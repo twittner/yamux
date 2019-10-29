@@ -20,52 +20,52 @@ criterion_group!(benches, concurrent);
 criterion_main!(benches);
 
 #[derive(Copy, Clone)]
-struct Params {
-    streams: u64,
-    messages: usize,
-    size: usize
-}
+struct Params { streams: u64, messages: u64 }
 
 impl fmt::Debug for Params {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "((streams {}) (messages {}) (size {}))", self.streams, self.messages, self.size)
+        write!(f, "((streams {}) (messages {}))", self.streams, self.messages)
     }
 }
 
 fn concurrent(c: &mut Criterion) {
-    c.bench_function_over_inputs("one by one", |b, &&params| {
-        let data: Bytes = std::iter::repeat(0x42u8).take(params.size).collect::<Vec<_>>().into();
-        b.iter(move || {
-            task::block_on(roundtrip(params.streams, params.messages, data.clone(), false))
-        })
-    },
-    &[
-        Params { streams: 1,   messages:   1, size: 4096},
-        Params { streams: 10,  messages:   1, size: 4096},
-        Params { streams: 1,   messages:  10, size: 4096},
-        Params { streams: 100, messages:   1, size: 4096},
-        Params { streams: 1,   messages: 100, size: 4096},
-        Params { streams: 10,  messages: 100, size: 4096},
-        Params { streams: 100, messages:  10, size: 4096},
-    ]);
+    let data: Bytes = std::iter::repeat(0x42u8)
+        .take(4096)
+        .collect::<Vec<_>>()
+        .into();
 
-    c.bench_function_over_inputs("all at once", |b, &&params| {
-        let data: Bytes = std::iter::repeat(0x42u8).take(params.size).collect::<Vec<_>>().into();
-        b.iter(move || roundtrip(params.streams, params.messages, data.clone(), true))
-    },
-    &[
-        Params { streams: 1,   messages:   1, size: 4096},
-        Params { streams: 10,  messages:   1, size: 4096},
-        Params { streams: 1,   messages:  10, size: 4096},
-        Params { streams: 100, messages:   1, size: 4096},
-        Params { streams: 1,   messages: 100, size: 4096},
-        Params { streams: 10,  messages: 100, size: 4096},
-        Params { streams: 100, messages:  10, size: 4096},
-    ]);
+    let params = &[
+        Params { streams: 1,   messages:   1},
+        Params { streams: 10,  messages:   1},
+        Params { streams: 1,   messages:  10},
+        Params { streams: 100, messages:   1},
+        Params { streams: 1,   messages: 100},
+        Params { streams: 10,  messages: 100},
+        Params { streams: 100, messages:  10},
+    ];
+
+    let data1 = data.clone();
+    let data2 = data.clone();
+
+    c.bench_function_over_inputs("one by one", move |b, &&params| {
+            let data = data1.clone();
+            b.iter(move || {
+                task::block_on(roundtrip(params.streams, params.messages, data.clone(), false))
+            })
+        },
+        params);
+
+    c.bench_function_over_inputs("all at once", move |b, &&params| {
+            let data = data2.clone();
+            b.iter(move || {
+                task::block_on(roundtrip(params.streams, params.messages, data.clone(), true))
+            })
+        },
+        params);
 }
 
-async fn roundtrip(nstreams: u64, nmessages: usize, data: Bytes, send_all: bool) {
-    let msg_len = data.len();
+async fn roundtrip(nstreams: u64, nmessages: u64, data: Bytes, send_all: bool) {
+    let msg_len = data.len() as u64;
     let (server, client) = Endpoint::new();
     let server = server.into_async_read();
     let client = client.into_async_read();
@@ -94,23 +94,23 @@ async fn roundtrip(nstreams: u64, nmessages: usize, data: Bytes, send_all: bool)
         let mut ctrl = ctrl.clone();
         task::spawn(async move {
             let stream = ctrl.open_stream().await.expect("open stream");
-            let (mut os, is) = Framed::new(stream, LengthCodec).split();
+            let (mut os, mut is) = Framed::new(stream, LengthCodec).split();
             if send_all {
                 // Send `nmessages` messages and receive `nmessages` messages.
-                os.send_all(&mut stream::iter(iter::repeat(data).take(nmessages)))
+                os.send_all(&mut stream::iter(iter::repeat(data).take(u64_as_usize(nmessages))))
                     .await
                     .expect("send_all");
-                let n = is.try_fold(0, |n, d| future::ready(Ok(n + d.len())))
+                let n = is.try_fold(0, |n, d| future::ready(Ok(n + d.len() as u64)))
                     .await
                     .expect("try_fold");
                 tx.unbounded_send(n).expect("unbounded_send")
             } else {
                 // Send and receive `nmessages` messages.
                 let mut n = 0;
-                for m in iter::repeat(data).take(nmessages) {
+                for m in iter::repeat(data).take(u64_as_usize(nmessages)) {
                     os.send(m).await.expect("send");
                     if let Some(d) = is.try_next().await.expect("receive") {
-                        n += d.len()
+                        n += d.len() as u64
                     } else {
                         break
                     }
@@ -121,11 +121,8 @@ async fn roundtrip(nstreams: u64, nmessages: usize, data: Bytes, send_all: bool)
         });
     }
 
-    let n = rx.take(nstreams)
-        .try_fold(0u64, |acc, n| future::ready(Ok(acc + n)))
-        .await
-        .expect("try_fold");
-    assert_eq!(n, nstreams as usize * nmessages * msg_len);
+    let n = rx.take(nstreams).fold(0u64, |acc, n| future::ready(acc + n)).await;
+    assert_eq!(n, nstreams * nmessages * msg_len);
     ctrl.close().await.expect("close")
 }
 
@@ -158,30 +155,31 @@ impl Stream for Endpoint {
     }
 }
 
-impl Sink<Bytes> for Endpoint {
-    type Error = io::Error;
-
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.outgoing)
-            .poll_ready(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+impl AsyncWrite for Endpoint {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if let Err(e) = ready!(Pin::new(&mut self.outgoing).poll_ready(cx)) {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
+        }
+        let n = buf.len();
+        if let Err(e) = Pin::new(&mut self.outgoing).start_send(Bytes::from(buf)) {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
+        }
+        Poll::Ready(Ok(n))
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        Pin::new(&mut self.outgoing)
-            .start_send(item)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.outgoing)
-            .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         Pin::new(&mut self.outgoing)
             .poll_close(cx)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 }
+
+#[cfg(any(target_pointer_width = "64"))]
+const fn u64_as_usize(a: u64) -> usize {
+    a as usize
+}
+
