@@ -252,6 +252,7 @@ impl AsyncWrite for Stream {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "stream is closed")))
             }
             if shared.credit == 0 {
+                log::trace!("{}/{}: no more credit left", self.conn, self.id);
                 shared.writer = Some(cx.waker().clone());
                 return Poll::Pending
             }
