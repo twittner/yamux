@@ -100,6 +100,7 @@ async fn roundtrip(nstreams: u64, nmessages: u64, data: Bytes, send_all: bool) {
                 os.send_all(&mut stream::iter(iter::repeat(data).take(u64_as_usize(nmessages))))
                     .await
                     .expect("send_all");
+                os.close().await.expect("close");
                 let n = is.try_fold(0, |n, d| future::ready(Ok(n + d.len() as u64)))
                     .await
                     .expect("try_fold");
@@ -121,7 +122,7 @@ async fn roundtrip(nstreams: u64, nmessages: u64, data: Bytes, send_all: bool) {
         });
     }
 
-    let n = rx.take(nstreams).fold(0u64, |acc, n| future::ready(acc + n)).await;
+    let n = rx.take(nstreams).fold(0, |acc, n| future::ready(acc + n)).await;
     assert_eq!(n, nstreams * nmessages * msg_len);
     ctrl.close().await.expect("close")
 }
@@ -157,12 +158,12 @@ impl Stream for Endpoint {
 
 impl AsyncWrite for Endpoint {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if let Err(e) = ready!(Pin::new(&mut self.outgoing).poll_ready(cx)) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
+        if ready!(Pin::new(&mut self.outgoing).poll_ready(cx)).is_err() {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()))
         }
         let n = buf.len();
-        if let Err(e) = Pin::new(&mut self.outgoing).start_send(Bytes::from(buf)) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
+        if Pin::new(&mut self.outgoing).start_send(Bytes::from(buf)).is_err() {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()))
         }
         Poll::Ready(Ok(n))
     }
@@ -174,7 +175,7 @@ impl AsyncWrite for Endpoint {
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         Pin::new(&mut self.outgoing)
             .poll_close(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|_| io::ErrorKind::ConnectionAborted.into())
     }
 }
 

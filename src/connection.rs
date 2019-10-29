@@ -8,12 +8,8 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-// TODO:
-//
-// - Change send to not also perform an implicit flush.
-// - Use an additional socket send buffer.
-
 mod control;
+mod socket;
 mod stream;
 
 use crate::{
@@ -28,6 +24,7 @@ use either::Either;
 use futures::{channel::{mpsc, oneshot}, prelude::*, stream::Fuse};
 use futures_codec::Framed;
 use nohash_hasher::IntMap;
+use socket::Socket;
 use std::{fmt, sync::Arc};
 
 pub use control::RemoteControl;
@@ -71,7 +68,7 @@ pub struct Connection<T> {
     id: Id,
     mode: Mode,
     config: Arc<Config>,
-    socket: Fuse<Framed<T, frame::Codec>>,
+    socket: Socket<Fuse<Framed<T, frame::Codec>>, Frame<()>>,
     next_id: u32,
     streams: IntMap<u32, Stream>,
     sender: mpsc::Sender<Command>,
@@ -131,7 +128,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         let id = Id(rand::random());
         log::debug!("new connection: {} ({:?})", id, mode);
         let (sender, receiver) = mpsc::channel(cfg.max_pending_frames);
-        let socket = Framed::new(socket, frame::Codec::new(cfg.max_buffer_size)).fuse();
+        let codec = frame::Codec::new(cfg.max_buffer_size);
+        let socket = Socket::new(Framed::new(socket, codec).fuse());
         Connection {
             id,
             mode,
@@ -182,6 +180,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         }
 
+        if let Err(ConnectionError::Io(_)) = result {
+            return result
+        }
+
         self.socket.close().await?;
         result
     }
@@ -226,6 +228,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         let mut frame = Frame::window_update(id, self.config.receive_window);
                         frame.header_mut().syn();
                         self.socket.send(frame.cast()).await?;
+                        self.socket.flush().await?;
                         let stream = {
                             let sender = self.sender.clone();
                             let config = self.config.clone();
@@ -251,12 +254,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         log::trace!("{}: closing stream {} of {}", self.id, id, self);
                         let mut header = Header::data(id, 0);
                         header.fin();
-                        self.socket.send(Frame::new(header).cast()).await?
+                        self.socket.send(Frame::new(header).cast()).await?;
+                        self.socket.flush().await?
                     }
                     // Close the whole connection.
                     Some(Command::Close(Either::Right(reply))) => {
                         log::debug!("{}: closing connection", self.id);
                         self.socket.send(Frame::term().cast()).await?;
+                        self.socket.flush().await?;
                         let _ = reply.send(());
                         break
                     }
@@ -264,12 +269,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     None => {
                         log::debug!("{}: end of channel", self.id);
                         self.socket.send(Frame::term().cast()).await?;
+                        self.socket.flush().await?;
                         break
                     }
                 },
 
                 // Handle incoming frames from the remote.
-                frame = self.socket.try_next() => match frame {
+                frame = self.socket.inner().try_next() => match frame {
                     Ok(Some(frame)) => {
                         log::trace!("{}: incoming frame: {}", self.id, frame.header());
                         if frame.header().tag() == Tag::GoAway {
