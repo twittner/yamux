@@ -35,13 +35,13 @@ fn concurrent(c: &mut Criterion) {
         .into();
 
     let params = &[
-        Params { streams: 1,   messages:   1},
-        Params { streams: 10,  messages:   1},
-        Params { streams: 1,   messages:  10},
-        Params { streams: 100, messages:   1},
-        Params { streams: 1,   messages: 100},
-        Params { streams: 10,  messages: 100},
-        Params { streams: 100, messages:  10},
+        Params { streams:   1, messages:   1 },
+        Params { streams:  10, messages:   1 },
+        Params { streams:   1, messages:  10 },
+        Params { streams: 100, messages:   1 },
+        Params { streams:   1, messages: 100 },
+        Params { streams:  10, messages: 100 },
+        Params { streams: 100, messages:  10 }
     ];
 
     let data1 = data.clone();
@@ -168,8 +168,10 @@ impl AsyncWrite for Endpoint {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.outgoing)
+            .poll_flush(cx)
+            .map_err(|_| io::ErrorKind::ConnectionAborted.into())
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {

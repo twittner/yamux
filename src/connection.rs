@@ -157,10 +157,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     pub async fn next_stream(&mut self) -> Result<Option<Stream>> {
         let result = self.next().await;
 
-        match &result {
-            Ok(Some(_)) => return result,
-            Ok(None) => log::debug!("{}: end", self.id),
-            Err(e) => log::error!("{}: connection error: {}", self.id, e)
+        if let Ok(Some(_)) = result {
+            return result
         }
 
         // At this point we are either at EOF or encountered an error.
@@ -179,12 +177,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
 
         if let Err(e) = &result {
-            if e.is_connection_closed() {
-                return Ok(None)
-            }
-            if e.is_io_error() {
-                return result
-            }
+            log::error!("{}: {}", self.id, e)
+        } else {
+            log::debug!("{}: end", self.id)
         }
 
         self.socket.close().await?;
@@ -198,8 +193,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     async fn next(&mut self) -> Result<Option<Stream>> {
         loop {
             // Remove stale streams on each iteration.
-            // If we ever get async. destructors we can replace this with
-            // streams sending a proper command on drop.
+            // If we ever get async destructors we can replace this with
+            // streams sending a proper command when dropped.
             let conn_id = self.id;
             self.streams.retain(|&id, stream| {
                 if stream.strong_count() == 1 {
@@ -267,7 +262,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 // Handle incoming frames from the remote.
                 frame = self.socket.try_next() => match frame {
                     Ok(Some(frame)) => {
-                        log::trace!("{}: incoming frame: {}", self.id, frame.header());
+                        log::trace!("{}: received: {}", self.id, frame.header());
                         if frame.header().tag() == Tag::GoAway {
                             break
                         }
@@ -402,7 +397,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 return Action::Update(frame)
             }
         } else if !is_finish {
-            log::warn!("{}/{}: data for unknown stream", self.id, stream_id);
+            log::debug!("{}/{}: data for unknown stream", self.id, stream_id);
             let mut header = Header::data(stream_id, 0);
             header.rst();
             return Action::Reset(Frame::new(header))
