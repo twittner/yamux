@@ -176,14 +176,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         }
 
-        if let Err(e) = &result {
-            log::error!("{}: {}", self.id, e)
-        } else {
-            log::debug!("{}: end", self.id)
+        match &result {
+            Err(ConnectionError::Io(_)) => result,
+            Err(ConnectionError::Closed) => Ok(None),
+            _ => {
+                self.socket.close().await.or(Ok::<_, ConnectionError>(()))?;
+                result
+            }
         }
-
-        self.socket.close().await?;
-        result
     }
 
     /// The actual implementation of `next_stream`.
@@ -224,7 +224,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         let id = self.next_stream_id()?;
                         let mut frame = Frame::window_update(id, self.config.receive_window);
                         frame.header_mut().syn();
-                        self.socket.send(frame.cast()).await?;
+                        self.socket.send(frame.cast()).await.or(Err(ConnectionError::Closed))?;
                         let stream = {
                             let sender = self.sender.clone();
                             let config = self.config.clone();
@@ -237,24 +237,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     }
                     Some(Command::SendFrame(frame)) => {
                         log::trace!("{}: sending: {}", self.id, frame.header());
-                        self.socket.send(frame).await?
+                        self.socket.send(frame).await.or(Err(ConnectionError::Closed))?
                     }
                     Some(Command::CloseStream(id)) => {
                         log::trace!("{}: closing stream {} of {}", self.id, id, self);
                         let mut header = Header::data(id, 0);
                         header.fin();
-                        self.socket.send(Frame::new(header).cast()).await?
+                        let frame = Frame::new(header).cast();
+                        self.socket.send(frame).await.or(Err(ConnectionError::Closed))?
                     }
                     Some(Command::CloseConnection(reply)) => {
                         log::debug!("{}: closing connection", self.id);
-                        self.socket.send(Frame::term().cast()).await?;
+                        let frame = Frame::term().cast();
+                        self.socket.send(frame).await.or(Err(ConnectionError::Closed))?;
                         let _ = reply.send(());
                         break
                     }
                     // The remote control and all our streams are gone, so terminate.
                     None => {
                         log::debug!("{}: end of channel", self.id);
-                        self.socket.send(Frame::term().cast()).await?;
+                        let frame = Frame::term().cast();
+                        self.socket.send(frame).await.or(Err(ConnectionError::Closed))?;
                         break
                     }
                 },
@@ -264,7 +267,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     Ok(Some(frame)) => {
                         log::trace!("{}: received: {}", self.id, frame.header());
                         if frame.header().tag() == Tag::GoAway {
-                            break
+                            return Err(ConnectionError::Closed)
                         }
                         match self.on_frame(frame) {
                             Action::None => continue,
@@ -272,33 +275,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                                 log::trace!("{}: new inbound {} of {}", self.id, stream, self);
                                 return Ok(Some(stream))
                             }
-                            Action::Update(frame) => {
-                                log::trace!("{}/{}: sending window update",
-                                    self.id,
-                                    frame.header().stream_id());
-                                self.socket.send(frame.cast()).await?
+                            Action::Update(f) => {
+                                log::trace!("{}/{}: sending update", self.id, f.header().stream_id());
+                                self.socket.send(f.cast()).await.or(Err(ConnectionError::Closed))?
                             }
-                            Action::Ping(frame) => {
-                                log::trace!("{}/{}: sending ping answer",
-                                    self.id,
-                                    frame.header().stream_id());
-                                self.socket.send(frame.cast()).await?
+                            Action::Ping(f) => {
+                                log::trace!("{}/{}: pong", self.id, f.header().stream_id());
+                                self.socket.send(f.cast()).await.or(Err(ConnectionError::Closed))?
                             }
-                            Action::Reset(frame) => {
-                                log::trace!("{}/{}: sending reset",
-                                    self.id,
-                                    frame.header().stream_id());
-                                self.socket.send(frame.cast()).await?
+                            Action::Reset(f) => {
+                                log::trace!("{}/{}: sending reset", self.id, f.header().stream_id());
+                                self.socket.send(f.cast()).await.or(Err(ConnectionError::Closed))?
                             }
-                            Action::Terminate(frame) => {
-                                log::trace!("{}: sending term frame", self.id);
-                                self.socket.send(frame.cast()).await?
+                            Action::Terminate(f) => {
+                                log::trace!("{}: sending term", self.id);
+                                self.socket.send(f.cast()).await.or(Err(ConnectionError::Closed))?
                             }
                         }
                     }
                     Ok(None) => {
                         log::debug!("{}: socket eof", self.id);
-                        break
+                        return Err(ConnectionError::Closed)
                     }
                     Err(e) => {
                         log::error!("{}: socket error: {}", self.id, e);
