@@ -44,9 +44,9 @@ impl Clone for RemoteControl {
 enum RemoteControlState {
     /// Nothing to wait for.
     Idle,
-    /// We have sent a [`Command::Open`] and await the result.
+    /// We have sent a [`Command::OpenStream`] and await the result.
     AwaitOpen(oneshot::Receiver<Result<Stream>>),
-    /// We have sent a [`Command::Close`] and await the result.
+    /// We have sent a [`Command::CloseConnection`] and await the result.
     AwaitClose(oneshot::Receiver<()>),
 }
 

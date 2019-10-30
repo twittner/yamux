@@ -29,11 +29,6 @@ impl fmt::Debug for Params {
 }
 
 fn concurrent(c: &mut Criterion) {
-    let data: Bytes = std::iter::repeat(0x42u8)
-        .take(4096)
-        .collect::<Vec<_>>()
-        .into();
-
     let params = &[
         Params { streams:   1, messages:   1 },
         Params { streams:  10, messages:   1 },
@@ -44,8 +39,9 @@ fn concurrent(c: &mut Criterion) {
         Params { streams: 100, messages:  10 }
     ];
 
-    let data1 = data.clone();
-    let data2 = data.clone();
+    let data0 = Bytes::from(vec![0x42; 4096]);
+    let data1 = data0.clone();
+    let data2 = data0.clone();
 
     c.bench_function_over_inputs("one by one", move |b, &&params| {
             let data = data1.clone();

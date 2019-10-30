@@ -49,7 +49,7 @@ async fn roundtrip(address: SocketAddr, nstreams: u64, data: Bytes) {
             let (mut os, is) = Framed::new(stream, LengthCodec).split();
             os.send(data.clone()).await.expect("send");
             os.close().await.expect("close");
-            let frame = is.try_concat().await.expect("concat2");
+            let frame = is.try_concat().await.expect("try_concat");
             assert_eq!(data, frame);
             tx.unbounded_send(1).expect("mpsc send")
         });
@@ -61,11 +61,7 @@ async fn roundtrip(address: SocketAddr, nstreams: u64, data: Bytes) {
 
 #[test]
 fn concurrent_streams() {
-    let data = std::iter::repeat(0x42u8)
-        .take(100 * 1024)
-        .collect::<Vec<_>>()
-        .into();
-
+    let data = Bytes::from(vec![0x42; 100 * 1024]);
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
     task::block_on(roundtrip(addr, 1000, data))
 }
