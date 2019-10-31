@@ -27,34 +27,26 @@ type Result<T> = std::result::Result<T, ConnectionError>;
 #[derive(Debug)]
 pub struct Control {
     sender: mpsc::Sender<Command>,
-    state: RemoteControlState
+    pending_open: Option<oneshot::Receiver<Result<Stream>>>,
+    pending_close: Option<oneshot::Receiver<()>>
 }
 
 impl Clone for Control {
     fn clone(&self) -> Self {
         Control {
             sender: self.sender.clone(),
-            state: RemoteControlState::Idle
+            pending_open: None,
+            pending_close: None
         }
     }
-}
-
-/// Internal state used for the implementation of the `poll_*` methods.
-#[derive(Debug)]
-enum RemoteControlState {
-    /// Nothing to wait for.
-    Idle,
-    /// We have sent a [`Command::OpenStream`] and await the result.
-    AwaitOpen(oneshot::Receiver<Result<Stream>>),
-    /// We have sent a [`Command::CloseConnection`] and await the result.
-    AwaitClose(oneshot::Receiver<()>),
 }
 
 impl Control {
     pub(crate) fn new(sender: mpsc::Sender<Command>) -> Self {
         Control {
             sender,
-            state: RemoteControlState::Idle
+            pending_open: None,
+            pending_close: None
         }
     }
 
@@ -76,44 +68,45 @@ impl Control {
     pub fn poll_open_stream(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Stream>> {
         ready!(self.sender.poll_ready(cx)?);
         loop {
-            match std::mem::replace(&mut self.state, RemoteControlState::Idle) {
-                RemoteControlState::Idle => {
+            match self.pending_open.take() {
+                None => {
                     let (tx, rx) = oneshot::channel();
                     self.sender.start_send(Command::OpenStream(tx))?;
-                    self.state = RemoteControlState::AwaitOpen(rx)
+                    self.pending_open = Some(rx)
                 }
-                RemoteControlState::AwaitOpen(mut rx) =>
-                    match Pin::new(&mut rx).poll(cx)? {
-                        Poll::Ready(result) => return Poll::Ready(result),
-                        Poll::Pending => {
-                            self.state = RemoteControlState::AwaitOpen(rx);
-                            return Poll::Pending
-                        }
+                Some(mut rx) => match Pin::new(&mut rx).poll(cx)? {
+                    Poll::Ready(result) => return Poll::Ready(result),
+                    Poll::Pending => {
+                        self.pending_open = Some(rx);
+                        return Poll::Pending
                     }
-                RemoteControlState::AwaitClose(_) => panic!("invalid remote control state")
+                }
             }
         }
+    }
+
+    /// Abort an ongoning open stream operation started by `poll_open_stream`.
+    pub fn abort_open_stream(&mut self) {
+        self.pending_open = None
     }
 
     /// [`Poll`] based alternative to [`Control::close`].
     pub fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
         ready!(self.sender.poll_ready(cx)?);
         loop {
-            match std::mem::replace(&mut self.state, RemoteControlState::Idle) {
-                RemoteControlState::Idle => {
+            match self.pending_close.take() {
+                None => {
                     let (tx, rx) = oneshot::channel();
                     self.sender.start_send(Command::CloseConnection(tx))?;
-                    self.state = RemoteControlState::AwaitClose(rx)
+                    self.pending_close = Some(rx)
                 }
-                RemoteControlState::AwaitClose(mut rx) =>
-                    match Pin::new(&mut rx).poll(cx)? {
-                        Poll::Ready(()) => return Poll::Ready(Ok(())),
-                        Poll::Pending => {
-                            self.state = RemoteControlState::AwaitClose(rx);
-                            return Poll::Pending
-                        }
+                Some(mut rx) => match Pin::new(&mut rx).poll(cx)? {
+                    Poll::Ready(()) => return Poll::Ready(Ok(())),
+                    Poll::Pending => {
+                        self.pending_close = Some(rx);
+                        return Poll::Pending
                     }
-                RemoteControlState::AwaitOpen(_) => panic!("invalid remote control state")
+                }
             }
         }
     }

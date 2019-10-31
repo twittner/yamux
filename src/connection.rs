@@ -233,7 +233,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         };
                         self.streams.insert(id.val(), stream.clone());
                         log::debug!("{}: new outbound {} of {}", self.id, stream, self);
-                        let _ = reply.send(Ok(stream));
+                        if reply.send(Ok(stream)).is_err() {
+                            log::debug!("{}: opening stream {} has been cancelled", self.id, id);
+                            let mut header = Header::data(id, 0);
+                            header.rst();
+                            let frame = Frame::new(header).cast();
+                            self.socket.send(frame).await.or(Err(ConnectionError::Closed))?
+                        }
                     }
                     Some(Command::SendFrame(frame)) => {
                         log::trace!("{}: sending: {}", self.id, frame.header());
