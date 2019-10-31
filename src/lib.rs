@@ -18,7 +18,7 @@
 //! - [`Connection`], which wraps the underlying I/O resource (e.g. a socket),
 //! - [`Stream`], which implements [`futures::io::AsyncRead`] and
 //!   [`futures::io::AsyncWrite`], and
-//! - [`RemoteControl`], to asynchronously control the [`Connection`].
+//! - [`Control`], to asynchronously control the [`Connection`].
 //!
 //! [1]: https://github.com/hashicorp/yamux/blob/master/spec.md
 
@@ -29,7 +29,7 @@ mod connection;
 mod error;
 mod frame;
 
-pub use crate::connection::{Connection, Mode, RemoteControl, State, Stream, into_stream};
+pub use crate::connection::{Connection, Mode, Control, State, Stream, into_stream};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{FrameDecodeError, header::{HeaderDecodeError, StreamId}};
 

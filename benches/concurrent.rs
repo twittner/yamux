@@ -81,7 +81,7 @@ async fn roundtrip(nstreams: u64, nmessages: u64, data: Bytes, send_all: bool) {
 
     let (tx, rx) = mpsc::unbounded();
     let conn = Connection::new(client, Config::default(), Mode::Client);
-    let mut ctrl = conn.remote_control();
+    let mut ctrl = conn.control();
     task::spawn(yamux::into_stream(conn).for_each(|_| future::ready(())));
 
     for _ in 0 .. nstreams {

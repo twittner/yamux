@@ -17,7 +17,7 @@ use futures_codec::{BytesCodec, Framed};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use rand::Rng;
 use std::{fmt::Debug, io, net::{Ipv4Addr, SocketAddr, SocketAddrV4}};
-use yamux::{Config, Connection, ConnectionError, Mode, RemoteControl, State};
+use yamux::{Config, Connection, ConnectionError, Mode, Control, State};
 
 #[test]
 fn prop_send_recv() {
@@ -40,7 +40,7 @@ fn prop_send_recv() {
             let client = async {
                 let socket = TcpStream::connect(address).await.expect("connect");
                 let connection = Connection::new(socket, Config::default(), Mode::Client);
-                let control = connection.remote_control();
+                let control = connection.control();
                 task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
                 send_recv(control, iter.clone()).await.expect("send_recv")
             };
@@ -73,7 +73,7 @@ fn prop_max_streams() {
 
             let socket = TcpStream::connect(address).await.expect("connect");
             let connection = Connection::new(socket, cfg, Mode::Client);
-            let mut control = connection.remote_control();
+            let mut control = connection.control();
             task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
             let mut v = Vec::new();
             for _ in 0 .. max_streams {
@@ -114,7 +114,7 @@ fn prop_send_recv_half_closed() {
             let client = async {
                 let socket = TcpStream::connect(address).await.expect("connect");
                 let connection = Connection::new(socket, Config::default(), Mode::Client);
-                let mut control = connection.remote_control();
+                let mut control = connection.control();
                 task::spawn(yamux::into_stream(connection).for_each(|_| future::ready(())));
                 let mut stream = control.open_stream().await.expect("C: open_stream");
                 stream.write_all(&msg.0).await.expect("C: send");
@@ -179,7 +179,7 @@ async fn repeat_echo(c: Connection<TcpStream>, n: u64) -> Result<(), ConnectionE
 
 /// For each message in `iter`, open a new stream, send the message and
 /// collect the response. The sequence of responses will be returned.
-async fn send_recv<I>(mut control: RemoteControl, iter: I) -> Result<Vec<Bytes>, ConnectionError>
+async fn send_recv<I>(mut control: Control, iter: I) -> Result<Vec<Bytes>, ConnectionError>
 where
     I: Iterator<Item = Bytes>
 {

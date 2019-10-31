@@ -25,14 +25,14 @@ type Result<T> = std::result::Result<T, ConnectionError>;
 /// as poll-based variants which may be useful inside of other poll based
 /// environments such as certain trait implementations.
 #[derive(Debug)]
-pub struct RemoteControl {
+pub struct Control {
     sender: mpsc::Sender<Command>,
     state: RemoteControlState
 }
 
-impl Clone for RemoteControl {
+impl Clone for Control {
     fn clone(&self) -> Self {
-        RemoteControl {
+        Control {
             sender: self.sender.clone(),
             state: RemoteControlState::Idle
         }
@@ -50,9 +50,9 @@ enum RemoteControlState {
     AwaitClose(oneshot::Receiver<()>),
 }
 
-impl RemoteControl {
+impl Control {
     pub(crate) fn new(sender: mpsc::Sender<Command>) -> Self {
-        RemoteControl {
+        Control {
             sender,
             state: RemoteControlState::Idle
         }
@@ -72,7 +72,7 @@ impl RemoteControl {
         Ok(rx.await?)
     }
 
-    /// [`Poll`] based alternative to [`RemoteControl::open_stream`].
+    /// [`Poll`] based alternative to [`Control::open_stream`].
     pub fn poll_open_stream(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Stream>> {
         ready!(self.sender.poll_ready(cx)?);
         loop {
@@ -95,7 +95,7 @@ impl RemoteControl {
         }
     }
 
-    /// [`Poll`] based alternative to [`RemoteControl::close`].
+    /// [`Poll`] based alternative to [`Control::close`].
     pub fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
         ready!(self.sender.poll_ready(cx)?);
         loop {

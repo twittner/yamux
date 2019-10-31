@@ -24,7 +24,7 @@ use futures_codec::Framed;
 use nohash_hasher::IntMap;
 use std::{fmt, sync::Arc};
 
-pub use control::RemoteControl;
+pub use control::Control;
 pub use stream::{State, Stream};
 
 type Result<T> = std::result::Result<T, ConnectionError>;
@@ -74,7 +74,7 @@ pub struct Connection<T> {
 
 /// Connection commands.
 ///
-/// These are sent from `Stream`s and `RemoteControl`s.
+/// These are sent from `Stream`s and `Control`s.
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Open a new stream to remote.
@@ -144,8 +144,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Get a controller for this connection.
-    pub fn remote_control(&self) -> RemoteControl {
-        RemoteControl::new(self.sender.clone())
+    pub fn control(&self) -> Control {
+        Control::new(self.sender.clone())
     }
 
     /// Get the next incoming stream, opened by the remote.
