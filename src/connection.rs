@@ -8,6 +8,24 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+// Potential improvements:
+// =======================
+//
+// 1. Instead of `futures::mpsc` use a more efficient channel implementation,
+//    e.g. `tokio-sync`. Unfortunately `tokio-sync` is about to be merged
+//    into `tokio` and depending on this large crate is not attractive,
+//    especially given the dire situation around cargo's flag resolution.
+//    Also the different `AsyncRead`/`AsyncWrite` traits require more work.
+// 2. Instead of `SinkExt::send` use a custom send operation that does not
+//    always perform an implicit flush. This also requires adding a
+//    `Command::Flush` so that `Streams` can trigger a flush which they
+//    would have to when they run out of credit, or else a `SinkExt::send_all`
+//    might never finish.
+// 3. When garbage collecting dropped `Streams` and their state is not
+//    `Closed`, send a RST to the remote so it is aware that the stream is
+//    no more. We currently rely on applications calling `Stream::poll_close`
+//    but they may not always do that.
+
 mod control;
 mod stream;
 
