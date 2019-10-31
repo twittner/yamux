@@ -17,30 +17,32 @@ use std::collections::VecDeque;
 /// result, e.g. the length of all bytes by summing up the lengths of all
 /// [`Bytes`] elements.
 #[derive(Debug)]
-pub struct Chunks {
+pub(crate) struct Chunks {
     seq: VecDeque<Bytes>
 }
 
 impl Chunks {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Chunks { seq: VecDeque::new() }
     }
 
-    pub fn len(&self) -> Option<usize> {
+    pub(crate) fn len(&self) -> Option<usize> {
         self.seq.iter().fold(Some(0), |total, x| {
             total.and_then(|n| n.checked_add(x.len()))
         })
     }
 
-    pub fn push(&mut self, x: Bytes) {
-        self.seq.push_back(x)
+    pub(crate) fn push(&mut self, x: Bytes) {
+        if !x.is_empty() {
+            self.seq.push_back(x)
+        }
     }
 
-    pub fn pop(&mut self) -> Option<Bytes> {
+    pub(crate) fn pop(&mut self) -> Option<Bytes> {
         self.seq.pop_front()
     }
 
-    pub fn front_mut(&mut self) -> Option<&mut Bytes> {
+    pub(crate) fn front_mut(&mut self) -> Option<&mut Bytes> {
         self.seq.front_mut()
     }
 }
