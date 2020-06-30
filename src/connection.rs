@@ -131,7 +131,7 @@ pub enum Mode {
 /// The connection identifier.
 ///
 /// Randomly generated, this is mainly intended to improve log output.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Id(u32);
 
 impl Id {
@@ -152,6 +152,14 @@ impl fmt::Display for Id {
         write!(f, "{:08x}", self.0)
     }
 }
+
+/// A token is required for each call to `Connection::next_stream`.
+///
+/// It guarantees that the previous invocation of `next_stream` was
+/// completed successfully, i.e. no future has been cancelled and no
+/// connection error been returned.
+#[derive(Debug)]
+pub struct Token(Id);
 
 /// A Yamux connection object.
 ///
@@ -267,13 +275,13 @@ impl<T> fmt::Display for Connection<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// Create a new `Connection` from the given I/O resource.
-    pub fn new(socket: T, cfg: Config, mode: Mode) -> Self {
+    pub fn new(socket: T, cfg: Config, mode: Mode) -> (Self, Token) {
         let id = Id::random();
         log::debug!("new connection: {} ({:?})", id, mode);
         let (stream_sender, stream_receiver) = mpsc::channel(MAX_COMMAND_BACKLOG);
         let (control_sender, control_receiver) = mpsc::channel(MAX_COMMAND_BACKLOG);
         let socket = frame::Io::new(id, socket, cfg.max_buffer_size).fuse();
-        Connection {
+        let connection = Connection {
             id,
             mode,
             config: Arc::new(cfg),
@@ -290,7 +298,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             garbage: Vec::new(),
             shutdown: Shutdown::NotStarted,
             is_closed: false
-        }
+        };
+        (connection, Token(id))
     }
 
     /// Get a controller for this connection.
@@ -301,24 +310,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// Get the next incoming stream, opened by the remote.
     ///
     /// This must be called repeatedly in order to make progress.
-    /// Once `Ok(None)` or `Err(_)` is returned the connection is
-    /// considered closed and no further invocation of this method
-    /// must be attempted.
-    ///
-    /// # Cancellation
-    ///
-    /// Please note that if you poll the returned [`Future`] it *must
-    /// not be cancelled* but polled until [`Poll::Ready`] is returned.
-    pub async fn next_stream(&mut self) -> Result<Option<Stream>> {
+    /// Once an `Err(_)` is returned the connection is considered
+    /// closed and no further invocation of this method is possible.
+    pub async fn next_stream(&mut self, token: Token) -> Result<(Stream, Token)> {
+        assert_eq!(self.id, token.0);
+
         if self.is_closed {
             log::debug!("{}: connection is closed", self.id);
-            return Ok(None)
+            return Err(ConnectionError::Closed)
         }
 
         let result = self.next().await;
 
-        if let Ok(Some(_)) = result {
-            return result
+        if let Ok(s) = result {
+            return Ok((s, token))
         }
 
         self.is_closed = true;
@@ -354,11 +359,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         }
 
-        if let Err(ConnectionError::Closed) = result {
-            return Ok(None)
-        }
-
-        result
+        result.map(move |stream| (stream, token))
     }
 
     /// Get the next inbound `Stream` and make progress along the way.
@@ -366,7 +367,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// This is called from `Connection::next_stream` instead of being a
     /// public method itself in order to guarantee proper closing in
     /// case of an error or at EOF.
-    async fn next(&mut self) -> Result<Option<Stream>> {
+    async fn next(&mut self) -> Result<Stream> {
         loop {
             self.garbage_collect().await?;
 
@@ -435,7 +436,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             if let Poll::Ready(frame) = inbound_frame {
                 if let Some(stream) = self.on_frame(frame).await? {
                     self.socket.get_mut().flush().await.or(Err(ConnectionError::Closed))?;
-                    return Ok(Some(stream))
+                    return Ok(stream)
                 }
             }
 
@@ -909,15 +910,18 @@ impl<T> Drop for Connection<T> {
 }
 
 /// Turn a Yamux [`Connection`] into a [`futures::Stream`].
-pub fn into_stream<T>(c: Connection<T>) -> impl futures::stream::Stream<Item = Result<Stream>>
+pub fn into_stream<T>(c: Connection<T>, t: Token) -> impl futures::stream::Stream<Item = Stream>
 where
     T: AsyncRead + AsyncWrite + Unpin
 {
-    futures::stream::unfold(c, |mut c| async {
-        match c.next_stream().await {
-            Ok(None) => None,
-            Ok(Some(stream)) => Some((Ok(stream), c)),
-            Err(e) => Some((Err(e), c))
+    futures::stream::unfold((c, t), |(mut c, t)| async {
+        match c.next_stream(t).await {
+            Ok((stream, t)) => Some((stream, (c, t))),
+            Err(ConnectionError::Closed) => None,
+            Err(e) => {
+                log::error!("{}: {}", c.id, e);
+                None
+            }
         }
     })
 }
